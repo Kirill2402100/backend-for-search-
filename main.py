@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
-from main.clickup_client import clickup_client
-from main.email_validator import validate_email_if_needed
+from clickup_client import clickup_client
+from email_validator import validate_email_if_needed
 from pydantic import BaseModel
 from typing import Optional
 
