@@ -1,7 +1,8 @@
-class LeadStatus:
-    NEW = "new_lead"
-    EMAIL_FOUND = "email_found"
+from enum import Enum
+
+class LeadStatus(str, Enum):
+    NEW = "new"
     EMAIL_VALID = "email_valid"
+    INVALID_EMAIL = "invalid_email"
     PROPOSAL_SENT = "proposal_sent"
     REPLIED = "replied"
-    INVALID_EMAIL = "invalid_email"
