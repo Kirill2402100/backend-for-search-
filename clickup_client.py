@@ -1,7 +1,7 @@
 import requests
 from typing import Optional, Dict, Any, List
 from config import settings
-from models import LeadStatus
+
 
 class ClickUpClient:
     BASE_URL = "https://api.clickup.com/api/v2"
@@ -9,283 +9,259 @@ class ClickUpClient:
     def __init__(self):
         self.headers = {
             "Authorization": settings.CLICKUP_API_TOKEN,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
 
-    # ----------------------------
-    # 1. Получить или создать List по штату
-    # ----------------------------
+    # -------------------------------------------------
+    # 1. Получить или создать List под штат
+    # -------------------------------------------------
     def get_or_create_list_for_state(self, state: str) -> str:
         """
         Возвращает list_id для штата.
-        Если листа с таким именем (например 'NY') нет — создаёт.
+        Если лист с таким именем (например "NY") нет – создаёт.
         """
 
-        # 1. Получаем все листы в Space
+        # 1) получаем все листы в Space
         lists_url = f"{self.BASE_URL}/space/{settings.CLICKUP_SPACE_ID}/list"
         resp = requests.get(lists_url, headers=self.headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
-        # 2. Ищем лист с нужным именем
+        # 2) ищем лист с именем штата
+        target_name = state.strip()
         for lst in data.get("lists", []):
-            if lst.get("name", "").strip().upper() == state.strip().upper():
+            if lst.get("name", "").strip().lower() == target_name.lower():
                 return lst["id"]
 
-        # 3. Если лист не найден — создаём
+        # 3) если такого нет — создаём
         create_url = f"{self.BASE_URL}/space/{settings.CLICKUP_SPACE_ID}/list"
         payload = {
-            "name": state,
-            "content": f"Лиды стоматологий штата {state}",
-            # можно сразу задать дефолтный статус "новый"
+            "name": target_name,
+            "content": f"Leads for {target_name}",
+            "due_date": None,
+            "due_date_time": False,
+            "priority": None,
+            "assignee": None,
+            "status": "новый",  # стартовый статус
         }
-        create_resp = requests.post(create_url, headers=self.headers, json=payload, timeout=10)
+        create_resp = requests.post(create_url, json=payload, headers=self.headers, timeout=10)
         create_resp.raise_for_status()
         created = create_resp.json()
+
         return created["id"]
 
-    # ----------------------------
-    # 2. Нормализация домена (чтобы не плодить дубликатов)
-    # ----------------------------
-    @staticmethod
-    def _normalize_website(website: Optional[str]) -> Optional[str]:
-        if not website:
-            return None
-        w = website.strip().lower()
-        w = w.replace("http://", "").replace("https://", "")
-        if w.endswith("/"):
-            w = w[:-1]
-        return w
-
-    # ----------------------------
-    # 3. Проверка дублей по email / website
-    # ----------------------------
-    def find_existing_task(
+    # -------------------------------------------------
+    # 2. Вспомогалка: собрать текст описания лида
+    # -------------------------------------------------
+    def _build_description(
         self,
-        list_id: str,
+        website: Optional[str],
         email: Optional[str],
-        website: Optional[str]
-    ) -> Optional[str]:
-        """
-        Пытаемся найти задачу в листе по email или домену сайта.
-        ClickUp не даёт идеальный search по кастомным полям через публичный API,
-        поэтому MVP-подход: просто читаем все задачи листа и ищем совпадение.
-        Для небольших листов это ок.
-        """
+        source: Optional[str],
+        extra_fields: Optional[Dict[str, Any]],
+    ) -> str:
+        lines = []
 
-        tasks_url = f"{self.BASE_URL}/list/{list_id}/task"
-        resp = requests.get(tasks_url, headers=self.headers, timeout=10)
+        if website:
+            lines.append(f"Website: {website}")
+        if email:
+            lines.append(f"Email: {email}")
+        if source:
+            lines.append(f"Source: {source}")
+
+        if extra_fields:
+            for k, v in extra_fields.items():
+                lines.append(f"{k}: {v}")
+
+        # Соединим в многострочный текст для ClickUp description
+        return "\n".join(lines)
+
+    # -------------------------------------------------
+    # 3. Найти задачу в листе по названию клиники
+    # -------------------------------------------------
+    def _find_task_by_name_in_list(self, list_id: str, clinic_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает JSON задачи если нашли таск с таким именем в list_id.
+        Иначе None.
+        """
+        url = f"{self.BASE_URL}/list/{list_id}/task"
+        resp = requests.get(url, headers=self.headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
-        normalized_site = self._normalize_website(website)
-
         for task in data.get("tasks", []):
-            task_name = task.get("name", "").strip().lower()
-
-            # сравнение по названию клиники? потом можно
-            # сейчас по email/сайту сначала:
-            # кастомные поля в ClickUp хранятся в `custom_fields`
-            for field in task.get("custom_fields", []):
-                field_name = field.get("name", "").lower()
-                field_value = str(field.get("value", "")).strip().lower()
-
-                # сравним email
-                if email and "email" in field_name and field_value == email.strip().lower():
-                    return task["id"]
-
-                # сравним домен сайта
-                if normalized_site and ("site" in field_name or "website" in field_name):
-                    if self._normalize_website(field_value) == normalized_site:
-                        return task["id"]
+            if task.get("name", "").strip().lower() == clinic_name.strip().lower():
+                return task
 
         return None
 
-    # ----------------------------
-    # 4. Создать или обновить лид (задачу)
-    # ----------------------------
+    # -------------------------------------------------
+    # 4. Создать новую задачу-лид
+    # -------------------------------------------------
+    def _create_lead_task(
+        self,
+        list_id: str,
+        clinic_name: str,
+        description: str,
+    ) -> str:
+        """
+        Создаёт задачу в ClickUp листе (лид) и возвращает её task_id.
+        Ставит статус "новый".
+        """
+        url = f"{self.BASE_URL}/list/{list_id}/task"
+        payload = {
+            "name": clinic_name,
+            "description": description,
+            "status": "новый",
+        }
+        resp = requests.post(url, json=payload, headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        task = resp.json()
+        return task["id"]
+
+    # -------------------------------------------------
+    # 5. Обновить существующую задачу-лид (описание, статус не трогаем)
+    # -------------------------------------------------
+    def _update_lead_task(
+        self,
+        task_id: str,
+        description: str,
+    ) -> str:
+        """
+        Обновляет description у существующей задачи.
+        Возвращает task_id обратно.
+        """
+        url = f"{self.BASE_URL}/task/{task_id}"
+        payload = {
+            "description": description,
+        }
+        resp = requests.put(url, json=payload, headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        return task_id
+
+    # -------------------------------------------------
+    # 6. Публичный метод: создать или обновить лида
+    # -------------------------------------------------
     def create_or_update_lead(
         self,
         state: str,
         clinic_name: str,
         website: Optional[str],
         email: Optional[str],
-        source: str,
-        extra_fields: Optional[Dict[str, Any]] = None
+        source: Optional[str],
+        extra_fields: Optional[Dict[str, Any]],
     ) -> str:
         """
-        - находит/создаёт лист для штата
-        - проверяет дубликат по email/сайту
-        - если дубль найден -> возвращает его task_id
-        - если нет -> создаёт новую задачу
+        1. Находим/создаём лист по штату
+        2. Проверяем, есть ли уже таск с таким clinic_name
+        3. Если да -> апдейтим описание (чтобы не было дубликатов)
+        4. Если нет -> создаём таск со статусом "новый"
         """
 
         list_id = self.get_or_create_list_for_state(state)
 
-        # дубликат?
-        existing = self.find_existing_task(list_id, email=email, website=website)
-        if existing:
-            return existing  # возвращаем id уже существующей задачи
+        description = self._build_description(
+            website=website,
+            email=email,
+            source=source,
+            extra_fields=extra_fields,
+        )
 
-        # формируем тело новой задачи
-        payload = {
-            "name": clinic_name,
-            "status": "новый",  # это твой статус в Space "Sales"
-            "custom_fields": []
-        }
+        existing_task = self._find_task_by_name_in_list(list_id, clinic_name)
 
-        # добавляем полезные данные в кастомные поля, НО:
-        # важно: у кастомных полей в ClickUp есть IDшники.
-        # Сейчас мы не знаем их ID через этот чат,
-        # поэтому на первой итерации можно просто положить часть данных в `description`.
-        desc_lines = []
-        if website:
-            desc_lines.append(f"Website: {website}")
-        if email:
-            desc_lines.append(f"Email: {email}")
-        if extra_fields:
-            for k, v in extra_fields.items():
-                if v:
-                    desc_lines.append(f"{k}: {v}")
-        desc_lines.append(f"Source: {source}")
-        desc_lines.append(f"State: {state}")
+        if existing_task:
+            task_id = existing_task["id"]
+            return self._update_lead_task(task_id, description)
+        else:
+            task_id = self._create_lead_task(list_id, clinic_name, description)
+            return task_id
 
-        payload["description"] = "\n".join(desc_lines)
-
-        # создаём задачу
-        create_task_url = f"{self.BASE_URL}/list/{list_id}/task"
-        resp = requests.post(create_task_url, headers=self.headers, json=payload, timeout=10)
-        resp.raise_for_status()
-        task = resp.json()
-        return task["id"]
-
-    # ----------------------------
-    # 5. Меняем статус лида (для рассылки/ответов)
-    # ----------------------------
-    def update_lead_status(self, task_id: str, status: str):
+    # -------------------------------------------------
+    # 7. Получить всех лидов (таски) из листа штата
+    # -------------------------------------------------
+    def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
         """
-        Для упрощения: мы просто меняем статус задачи.
-        В твоём Sales Space есть статусы:
-        - "новый"
-        - "взял в работу"
-        - "ожидаем ответа"
-        - "звонок назначен"
-        - "кп отправлено"
-        - "отказ клиента"
-        - "сделка закрыта"
+        Возвращает массив лидов вида:
+        [
+            {
+                "task_id": "...",
+                "clinic_name": "...",
+                "website": "...",
+                "email": "..."
+            },
+            ...
+        ]
+
+        Парсит site/email из description.
+        """
+
+        url = f"{self.BASE_URL}/list/{list_id}/task"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        leads: List[Dict[str, Any]] = []
+
+        for task in data.get("tasks", []):
+            task_id = task["id"]
+            clinic_name = task.get("name", "").strip()
+
+            # ClickUp может хранить текст и в description, и в text_content (рендер html)
+            description = (
+                task.get("text_content")
+                or task.get("description")
+                or ""
+            )
+
+            website_val = None
+            email_val = None
+
+            # Грубый парсинг строк
+            for raw_line in description.splitlines():
+                line = raw_line.strip()
+
+                # сайт
+                if website_val is None:
+                    if line.lower().startswith("website:"):
+                        website_val = line.split(":", 1)[1].strip()
+                    elif ("http://" in line or "https://" in line) and " " not in line:
+                        # fallback
+                        website_val = line
+
+                # email
+                if email_val is None:
+                    if line.lower().startswith("email:"):
+                        email_val = line.split(":", 1)[1].strip()
+                    elif "@" in line and "." in line:
+                        # fallback: возьмём первое что похоже на email
+                        email_val = line
+
+            leads.append(
+                {
+                    "task_id": task_id,
+                    "clinic_name": clinic_name,
+                    "website": website_val,
+                    "email": email_val,
+                }
+            )
+
+        return leads
+
+    # -------------------------------------------------
+    # 8. Переместить лида в другой статус (колонку)
+    # -------------------------------------------------
+    def move_lead_to_status(self, task_id: str, new_status: str) -> bool:
+        """
+        Обновляет статус задачи (например 'кп отправлено').
         """
         url = f"{self.BASE_URL}/task/{task_id}"
         payload = {
-            "status": self._map_internal_status_to_clickup(status)
+            "status": new_status
         }
-        resp = requests.put(url, headers=self.headers, json=payload, timeout=10)
+        resp = requests.put(url, json=payload, headers=self.headers, timeout=10)
         resp.raise_for_status()
         return True
 
-    def _map_internal_status_to_clickup(self, internal_status: str) -> str:
-        """
-        Наши внутренние статусы (LeadStatus.EMAIL_VALID и т.п.)
-        -> статус колонки в ClickUp board.
-        Это маппинг, который мы контролируем сами.
-        """
-        if internal_status == LeadStatus.EMAIL_VALID:
-            return "взял в работу"
-        if internal_status == LeadStatus.PROPOSAL_SENT:
-            return "кп отправлено"
-        if internal_status == LeadStatus.REPLIED:
-            return "звонок назначен"
-        if internal_status == LeadStatus.INVALID_EMAIL:
-            return "отказ клиента"  # или можешь сделать отдельную колонку потом
-        # default
-        return "новый"
 
-    # ----------------------------
-    # 6. Получить лидов для рассылки
-    # ----------------------------
-    def get_leads_ready_to_send(self, state: str, limit: int) -> List[Dict[str, Any]]:
-        """
-        MVP: берём просто все задачи из листа штата и считаем "готовыми к рассылке"
-        тех, у кого статус = 'взял в работу' (то есть EMAIL_VALID).
-        Потом можно усложнить.
-        """
-
-        list_id = self.get_or_create_list_for_state(state)
-
-        tasks_url = f"{self.BASE_URL}/list/{list_id}/task"
-        resp = requests.get(tasks_url, headers=self.headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        leads = []
-        for t in data.get("tasks", []):
-            if t.get("status", {}).get("status") == "взял в работу":
-                # пробуем достать email и сайт из description
-                desc = t.get("description", "") or ""
-                email_val = extract_from_description(desc, prefix="Email:")
-                site_val = extract_from_description(desc, prefix="Website:")
-
-                leads.append({
-                    "clickup_task_id": t["id"],
-                    "clinic_name": t.get("name", ""),
-                    "email": email_val,
-                    "website": site_val
-                })
-
-        return leads[:limit]
-
-    # ----------------------------
-    # 7. Статистика по штату
-    # ----------------------------
-    def get_state_stats(self, state: str) -> Dict[str, int]:
-        """
-        Возвращает счетчики:
-        total,
-        ready_to_send (status == 'взял в работу'),
-        sent (status == 'кп отправлено'),
-        replied (status == 'звонок назначен')
-        """
-
-        list_id = self.get_or_create_list_for_state(state)
-
-        tasks_url = f"{self.BASE_URL}/list/{list_id}/task"
-        resp = requests.get(tasks_url, headers=self.headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        total = 0
-        ready_to_send = 0
-        sent = 0
-        replied = 0
-
-        for t in data.get("tasks", []):
-            total += 1
-            status_name = t.get("status", {}).get("status", "").strip().lower()
-
-            if status_name == "взял в работу":
-                ready_to_send += 1
-            elif status_name == "кп отправлено":
-                sent += 1
-            elif status_name == "звонок назначен":
-                replied += 1
-
-        return {
-            "total": total,
-            "ready_to_send": ready_to_send,
-            "sent": sent,
-            "replied": replied
-        }
-
-# простая утилита: вытащить значение из description по префиксу
-def extract_from_description(desc: str, prefix: str) -> Optional[str]:
-    """
-    Ищет строки формата:
-    'Email: something@clinic.com'
-    'Website: https://...'
-    """
-    for line in desc.splitlines():
-        line = line.strip()
-        if line.lower().startswith(prefix.lower()):
-            return line[len(prefix):].strip()
-    return None
-
+# один глобальный клиент, который можно импортировать и переиспользовать
 clickup_client = ClickUpClient()
