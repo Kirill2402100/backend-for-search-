@@ -1,7 +1,7 @@
 import requests
 from typing import Optional, Dict, Any, List
-from main.config import settings
-from main.models import LeadStatus
+from config import settings
+from models import LeadStatus
 
 class ClickUpClient:
     BASE_URL = "https://api.clickup.com/api/v2"
