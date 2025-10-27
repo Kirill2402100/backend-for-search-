@@ -1,5 +1,5 @@
 import requests
-from main.config import settings
+from config import settings
 from requests.auth import HTTPBasicAuth
 
 def validate_email_if_needed(email: str) -> bool:
