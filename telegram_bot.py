@@ -1,12 +1,19 @@
+# telegram_bot.py
 from typing import Dict, Any, Optional, List
-from clickup_client import clickup_client, READY_STATUS, SENT_STATUS, REPLIED_STATUS
-from telegram_notifier import send_message
-from send import run_send
-from email_validator import validate_email_if_needed
-import imaplib, email
-from email.header import decode_header
-from config import settings
+import imaplib
+import email
 
+from config import settings
+from clickup_client import clickup_client, READY_STATUS, SENT_STATUS, REPLIED_STATUS
+from telegram_notifier import send_message as tg_send
+from send import run_send
+
+# Нужен poller'у (deleteWebhook/getUpdates)
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
+# ------------------------
+# Штаты и клавиатура
+# ------------------------
 US_STATES = [
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
     "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
@@ -15,13 +22,22 @@ US_STATES = [
     "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
 ]
 
-# простая "память" выбора штата на время жизни процесса
+# «Память» выбранного штата по chat_id на время жизни процесса
 USER_STATE: Dict[int, str] = {}
 
 
+def _allowed_chat(chat_id: int) -> bool:
+    """
+    Если TELEGRAM_CHAT_ID задан — отвечаем только ему.
+    Если пусто — отвечаем всем (удобно для отладки).
+    """
+    want = str(getattr(settings, "TELEGRAM_CHAT_ID", "")).strip()
+    return (not want) or (str(chat_id) == want)
+
+
 def _states_keyboard() -> Dict[str, Any]:
-    rows = []
-    row = []
+    rows: List[List[Dict[str, str]]] = []
+    row: List[Dict[str, str]] = []
     for i, s in enumerate(US_STATES, start=1):
         row.append({"text": s})
         if i % 5 == 0:
@@ -37,6 +53,9 @@ def _parse_cmd(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+# ------------------------
+# Бизнес-логика
+# ------------------------
 def _stats_for_state(state: str) -> str:
     list_id = clickup_client.get_or_create_list_for_state(state)
     leads = clickup_client.get_leads_from_list(list_id)
@@ -60,10 +79,10 @@ def _stats_for_state(state: str) -> str:
 
 
 def _handle_collect(chat_id: int, state: str) -> None:
-    # сейчас просто создаём лист (сбор каталога делается твоими внешними скриптами)
+    # Сейчас просто гарантируем наличие листа и показываем сводку
     list_id = clickup_client.get_or_create_list_for_state(state)
     stats = _stats_for_state(state)
-    send_message(chat_id, f"Лист для штата <b>{state}</b> готов (list_id={list_id}).\n\n{stats}")
+    tg_send(chat_id, f"Лист для штата <b>{state}</b> готов (list_id={list_id}).\n\n{stats}", parse_mode="HTML")
 
 
 def _handle_send(chat_id: int, state: str, limit: int) -> None:
@@ -77,12 +96,12 @@ def _handle_send(chat_id: int, state: str, limit: int) -> None:
         f"Осталось (с email, не отправлено): {report['remaining_unsent']}\n"
         f"Всего в листе: {report['total_in_list']}"
     )
-    send_message(chat_id, text)
+    tg_send(chat_id, text, parse_mode="HTML")
 
 
 def _imap_fetch_unseen_froms(n_last: int = 50) -> List[str]:
-    """Простой разбор входящих (INBOX, UNSEEN) — возвращаем список адресов FROM"""
-    host = "mail.adm.tools"
+    """Читаем INBOX/UNSEEN и возвращаем список email-адресов отправителей."""
+    host = getattr(settings, "SMTP_HOST", "mail.adm.tools")
     username = settings.SMTP_USERNAME
     password = settings.SMTP_PASSWORD
 
@@ -103,17 +122,17 @@ def _imap_fetch_unseen_froms(n_last: int = 50) -> List[str]:
         msg = email.message_from_bytes(msg_data[0][1])
         from_hdr = email.utils.parseaddr(msg.get("From"))[1]
         out.append(from_hdr)
-        # пометим как прочитанное
+        # помечаем как прочитанное
         M.store(msg_id, "+FLAGS", "\\Seen")
     M.logout()
     return out
 
 
 def _handle_replies(chat_id: int) -> None:
-    """Обрабатываем ответы: ищем задачу по email отправителя и переносим в статус REPLIED_STATUS"""
+    """Переносим задачи с ответами в статус REPLIED_STATUS и уведомляем."""
     from_list = _imap_fetch_unseen_froms()
     if not from_list:
-        send_message(chat_id, "Новых ответов нет.")
+        tg_send(chat_id, "Новых ответов нет.")
         return
 
     moved = 0
@@ -122,23 +141,76 @@ def _handle_replies(chat_id: int) -> None:
         if task:
             clickup_client.move_lead_to_status(task["task_id"], REPLIED_STATUS)
             moved += 1
-            send_message(chat_id, f"Ответ от <b>{task['clinic_name']}</b> ({addr}). Перенесено в «{REPLIED_STATUS}».")
+            tg_send(
+                chat_id,
+                f"Ответ от <b>{task['clinic_name']}</b> ({addr}). Перенесено в «{REPLIED_STATUS}».",
+                parse_mode="HTML",
+            )
     if moved == 0:
-        send_message(chat_id, "Ответы получены, но соответствующие задачи не найдены.")
+        tg_send(chat_id, "Ответы получены, но соответствующие задачи не найдены.")
 
 
+def _help_text() -> str:
+    return (
+        "Команды:\n"
+        "/menu — клавиатура штатов\n"
+        "/collect NY — создать лист и показать статистику (синоним: /search NY)\n"
+        "/send NY 10 — отправить письма (limit) или /send 10 (если штат выбран)\n"
+        "/stats NY — сводка по штату\n"
+        "/replies — обработать входящие ответы\n"
+        "/id — показать ваш chat id"
+    )
+
+
+# ------------------------
+# Регистрация команд в меню Telegram
+# ------------------------
+def register_commands() -> None:
+    token = settings.TELEGRAM_BOT_TOKEN
+    if not token:
+        return
+    try:
+        import requests
+        commands = [
+            {"command": "menu",    "description": "Клавиатура штатов"},
+            {"command": "help",    "description": "Справка по командам"},
+            {"command": "id",      "description": "Показать мой chat id"},
+            {"command": "collect", "description": "Создать лист и сводку по штату"},
+            {"command": "search",  "description": "Алиас для /collect"},
+            {"command": "send",    "description": "Отправить письма"},
+            {"command": "stats",   "description": "Статистика по штату"},
+            {"command": "replies", "description": "Обработать входящие ответы"},
+        ]
+        r = requests.post(
+            f"{TELEGRAM_API_BASE}/bot{token}/setMyCommands",
+            json={"commands": commands},
+            timeout=10,
+        )
+        print(f"[tg] setMyCommands: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[tg] setMyCommands error: {e}")
+
+
+# ------------------------
+# Обработчик апдейтов (для poller и/или вебхука)
+# ------------------------
 def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return {"ok": True}
 
-    chat_id = msg["chat"]["id"]
+    chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
 
+    if not chat_id or not text:
+        return {"ok": True}
+    if not _allowed_chat(chat_id):
+        return {"ok": True}
+
     # выбор штата кнопкой
-    if text in US_STATES:
-        USER_STATE[chat_id] = text
-        send_message(chat_id, f"Штат выбран: <b>{text}</b>")
+    if text.upper() in US_STATES:
+        USER_STATE[chat_id] = text.upper()
+        tg_send(chat_id, f"Штат выбран: <b>{text.upper()}</b>", parse_mode="HTML")
         return {"ok": True}
 
     parts = _parse_cmd(text)
@@ -148,25 +220,21 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     cmd = parts[0].lower()
 
     if cmd in ("/start", "/help"):
-        send_message(
-            chat_id,
-            "Команды:\n"
-            "/menu — клавиатура штатов\n"
-            "/collect NY — создать лист и показать статистику\n"
-            "/send NY 10 — отправить письма (limit)\n"
-            "/stats NY — сводка по штату\n"
-            "/replies — обработать входящие ответы"
-        )
+        tg_send(chat_id, _help_text())
+        return {"ok": True}
+
+    if cmd == "/id":
+        tg_send(chat_id, f"Ваш chat id: <code>{chat_id}</code>", parse_mode="HTML")
         return {"ok": True}
 
     if cmd == "/menu":
-        send_message(chat_id, "Выбери штат, затем используй /collect, /send, /stats", reply_markup=_states_keyboard())
+        tg_send(chat_id, "Выбери штат, затем используй /collect, /send, /stats", reply_markup=_states_keyboard())
         return {"ok": True}
 
-    if cmd == "/collect":
+    if cmd in ("/collect", "/search"):
         state = (parts[1].upper() if len(parts) > 1 else USER_STATE.get(chat_id))
         if not state or state not in US_STATES:
-            send_message(chat_id, "Укажи штат: /collect NY или выбери через /menu")
+            tg_send(chat_id, "Укажи штат: /collect NY или выбери через /menu")
             return {"ok": True}
         _handle_collect(chat_id, state)
         return {"ok": True}
@@ -179,7 +247,7 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
         else:
             state = USER_STATE.get(chat_id)
             if not state:
-                send_message(chat_id, "Сначала укажи штат: /send NY 1 или выбери через /menu")
+                tg_send(chat_id, "Сначала укажи штат: /send NY 1 или выбери через /menu")
                 return {"ok": True}
             lim = int(parts[1]) if len(parts) > 1 else 50
         _handle_send(chat_id, state, lim)
@@ -188,15 +256,15 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     if cmd == "/stats":
         state = (parts[1].upper() if len(parts) > 1 else USER_STATE.get(chat_id))
         if not state or state not in US_STATES:
-            send_message(chat_id, "Укажи штат: /stats NY или выбери через /menu")
+            tg_send(chat_id, "Укажи штат: /stats NY или выбери через /menu")
             return {"ok": True}
-        send_message(chat_id, _stats_for_state(state))
+        tg_send(chat_id, _stats_for_state(state), parse_mode="HTML")
         return {"ok": True}
 
     if cmd == "/replies":
         _handle_replies(chat_id)
         return {"ok": True}
 
-    # по умолчанию — подсказка
-    send_message(chat_id, "Не понимаю команду. Напиши /help")
+    # По умолчанию — подсказка
+    tg_send(chat_id, "Не понимаю команду. Напиши /help")
     return {"ok": True}
