@@ -1,54 +1,111 @@
+# main.py
+import os
+import threading
+import logging
+from typing import Dict, Any
+
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import threading
-import os
-import logging
 
 from config import settings
-from telegram_bot import register_commands
-from telegram_poller import start_polling
+from telegram_bot import handle_update
+from telegram_poller import start_polling, register_commands
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("app")
+log = logging.getLogger("app")
 
-app = FastAPI(title="backend-for-search")
+app = FastAPI(title="lead-generator")
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
+BOT_TOKEN = settings.TELEGRAM_BOT_TOKEN
 
-# Webhook-эндпоинт остаётся (вдруг когда-то захочешь вернуться на вебхуки),
-# но в текущей конфигурации мы работаем через polling.
-@app.post("/tg/webhook")
-async def tg_webhook(request: Request):
+
+def _truthy(val: Any) -> bool:
+    """Корректно приводим значение из ENV к bool."""
+    s = str(val).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
+def _delete_webhook() -> None:
     try:
-        update = await request.json()
-    except Exception:
-        return JSONResponse({"ok": True})
-    # намеренно ничего не делаем — сейчас используется polling
-    return JSONResponse({"ok": True})
-
-def _start_background_poller():
-    try:
-        start_polling()
+        url = (TELEGRAM_API_BASE + "/deleteWebhook").format(token=BOT_TOKEN)
+        r = requests.get(url, timeout=10)
+        log.info("[tg] deleteWebhook: %s %s", r.status_code, r.text)
     except Exception as e:
-        logger.exception("Telegram polling crashed: %s", e)
+        log.warning("[tg] deleteWebhook error: %s", e)
+
+
+def _set_commands() -> None:
+    try:
+        payload = {
+            "commands": [
+                {"command": "menu", "description": "Открыть меню со штатами"},
+                {"command": "help", "description": "Справка по командам"},
+                {"command": "search", "description": "Сбор/лист для штата: /search NY"},
+                {"command": "send", "description": "Отправить N писем: /send 50  (или /send NY 50)"},
+                {"command": "stats", "description": "Статистика по штату: /stats NY"},
+                {"command": "replies", "description": "Разобрать входящие ответы"},
+            ]
+        }
+        url = (TELEGRAM_API_BASE + "/setMyCommands").format(token=BOT_TOKEN)
+        r = requests.post(url, json=payload, timeout=10)
+        log.info("[tg] setMyCommands: %s %s", r.status_code, r.text)
+    except Exception as e:
+        log.warning("[tg] setMyCommands error: %s", e)
+
 
 @app.on_event("startup")
-def on_startup():
-    # 1) зарегистрировать команды бота в меню
+def on_startup() -> None:
+    # 1) Зарегистрируем команды (в боте появится меню автоподстановки)
     try:
         register_commands()
-        logger.info("Telegram commands registered")
+    except TypeError:
+        # на случай старой сигнатуры register_commands() без аргументов
+        try:
+            register_commands()  # noqa: FBT003
+        except Exception as e:  # pragma: no cover
+            log.warning("register_commands error: %s", e)
     except Exception as e:
-        logger.warning("register_commands error: %s", e)
+        log.warning("register_commands error: %s", e)
 
-    # 2) при TELEGRAM_POLLING=1 — стартуем long-polling в отдельном потоке
-    flag = str(getattr(settings, "TELEGRAM_POLLING", "0")).strip()
-    enabled = flag in ("1", "true", "True", "yes", "on")
-    if enabled:
-        t = threading.Thread(target=_start_background_poller, daemon=True, name="tg-poller")
-        t.start()
-        logger.info("Telegram polling started in background thread")
+    # Дублируем через прямой REST на всякий случай
+    _set_commands()
+
+    # 2) Гасим вебхук (если вдруг был включён) — иначе getUpdates не работает
+    _delete_webhook()
+
+    # 3) Запускаем polling, если включён флагом
+    enabled_env = os.getenv("TELEGRAM_POLLING", getattr(settings, "TELEGRAM_POLLING", "0"))
+    polling_enabled = _truthy(enabled_env)
+    if polling_enabled:
+        th = threading.Thread(target=start_polling, name="tg-poller", daemon=True)
+        th.start()
+        log.info("Polling started (TELEGRAM_POLLING=%r)", enabled_env)
     else:
-        logger.info("Polling disabled (set TELEGRAM_POLLING=1 to enable)")
+        log.info("Polling disabled (set TELEGRAM_POLLING=1 to enable)")
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "lead-generator"}
+
+
+@app.post("/tg/webhook")
+async def tg_webhook(req: Request):
+    """Эндпоинт на будущее — если решите вернуться к webhook-режиму."""
+    try:
+        upd: Dict[str, Any] = await req.json()
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    try:
+        return JSONResponse(handle_update(upd))
+    except Exception as e:
+        log.exception("webhook handler error: %s", e)
+        return JSONResponse({"ok": True})
