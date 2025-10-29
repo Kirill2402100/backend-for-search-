@@ -3,16 +3,15 @@ import logging
 from typing import Dict, List, Optional, Any
 
 import requests
-
 from config import settings
 
 logger = logging.getLogger("app")
 
-
-# Статусы (должны совпадать с тем, что настраиваем в листе)
+# Константы статусов (совпадают с колонками в листе)
 NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
+INVALID_STATUS = "INVALID"     # <— добавлен для совместимости с send.py
 REPLIED_STATUS = "REPLIED"
 
 
@@ -20,6 +19,7 @@ class ClickUpClient:
     BASE_URL = "https://api.clickup.com/api/v2"
 
     def __init__(self) -> None:
+        # team_id сейчас не используется, но оставим для будущих методов
         self.team_id: str = str(settings.CLICKUP_TEAM_ID)
         self.space_id: str = str(settings.CLICKUP_SPACE_ID)
         self.headers = {
@@ -27,9 +27,7 @@ class ClickUpClient:
             "Content-Type": "application/json",
         }
 
-    # -----------------------------
-    # HTTP helpers
-    # -----------------------------
+    # ---------- HTTP helpers ----------
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         r = requests.get(url, headers=self.headers, params=params or {}, timeout=30)
         if r.status_code != 200:
@@ -48,9 +46,7 @@ class ClickUpClient:
             raise RuntimeError(f"ClickUp PUT {url} -> {r.status_code}: {r.text}")
         return r.json() if r.text else {}
 
-    # -----------------------------
-    # Lists (Boards)
-    # -----------------------------
+    # ---------- Lists ----------
     def _lists_in_space(self) -> List[Dict[str, Any]]:
         url = f"{self.BASE_URL}/space/{self.space_id}/list"
         data = self._get(url)
@@ -58,32 +54,29 @@ class ClickUpClient:
 
     def _find_list_id_by_name(self, name: str) -> Optional[str]:
         for lst in self._lists_in_space():
-            if lst.get("name") == name:
+            if (lst.get("name") or "") == name:
                 return str(lst.get("id"))
         return None
 
     def create_list_in_space(self, name: str) -> str:
-        """
-        Создаёт List в текущем Space. Возвращает list_id.
-        """
         url = f"{self.BASE_URL}/space/{self.space_id}/list"
         data = self._post(url, {"name": name})
-        list_id = str(data["id"])
-        return list_id
+        return str(data["id"])
 
     def set_list_statuses(self, list_id: str) -> None:
         """
-        Включает override_statuses и задаёт нужные «колонки» (статусы).
-        Типы: open/custom/closed.
+        Включаем override_statuses и задаём колонки (статусы).
+        Типы допустимые ClickUp: open / custom / closed
         """
         url = f"{self.BASE_URL}/list/{list_id}"
         payload = {
             "override_statuses": True,
             "statuses": [
-                {"status": NEW_STATUS,     "type": "open",   "color": "#6b6b6b"},
-                {"status": READY_STATUS,   "type": "custom", "color": "#8c78ff"},
-                {"status": SENT_STATUS,    "type": "custom", "color": "#4aa3ff"},
-                {"status": REPLIED_STATUS, "type": "closed", "color": "#2ecc71"},
+                {"status": NEW_STATUS,      "type": "open",   "color": "#6b6b6b"},
+                {"status": READY_STATUS,    "type": "custom", "color": "#8c78ff"},
+                {"status": SENT_STATUS,     "type": "custom", "color": "#4aa3ff"},
+                {"status": INVALID_STATUS,  "type": "custom", "color": "#ff8c66"},
+                {"status": REPLIED_STATUS,  "type": "closed", "color": "#2ecc71"},
             ],
         }
         try:
@@ -93,39 +86,29 @@ class ClickUpClient:
 
     def get_or_create_list_for_state(self, state: str) -> str:
         """
-        Возвращает list_id для штата. Если листа нет — создаёт и настраивает статусы.
+        Возвращает list_id для штата. Если нет — создаёт лист LEADS-{STATE}
+        и настраивает колонки.
         """
         name = f"LEADS-{state}"
         list_id = self._find_list_id_by_name(name)
         if list_id:
             return list_id
+        list_id = self.create_list_in_space(name)
+        self.set_list_statuses(list_id)
+        logger.info("ClickUp: created list %s for state %s", list_id, state)
+        return list_id
 
-        try:
-            list_id = self.create_list_in_space(name)
-            self.set_list_statuses(list_id)
-            logger.info("ClickUp: created list %s for state %s", list_id, state)
-            return list_id
-        except Exception as e:
-            logger.error("ClickUp create list failed for state %s: %s", state, e)
-            raise
-
-    # -----------------------------
-    # Tasks
-    # -----------------------------
+    # ---------- Tasks ----------
     def _list_custom_fields_map(self, list_id: str) -> Dict[str, str]:
-        """
-        Возвращает словарь {field_id: field_name} для листа.
-        """
         url = f"{self.BASE_URL}/list/{list_id}/field"
         try:
             data = self._get(url)
         except Exception as e:
             logger.warning("ClickUp: cannot fetch fields for list %s: %s", list_id, e)
             return {}
-
         mapping: Dict[str, str] = {}
         for f in data or []:
-            fid = str(f.get("id"))
+            fid = str(f.get("id") or "")
             name = (f.get("name") or "").strip()
             if fid and name:
                 mapping[fid] = name
@@ -136,13 +119,8 @@ class ClickUpClient:
         task: Dict[str, Any],
         field_map: Dict[str, str],
     ) -> Optional[str]:
-        """
-        Пытаемся извлечь email из custom_fields по названию (email/e-mail/...).
-        """
         cf = task.get("custom_fields") or []
         candidates = {"email", "e-mail", "contact email", "mail"}
-        best: Optional[str] = None
-
         for item in cf:
             fid = str(item.get("id") or "")
             value = item.get("value")
@@ -150,81 +128,42 @@ class ClickUpClient:
                 continue
             fname = (field_map.get(fid, "") or "").lower()
             if any(k in fname for k in candidates):
-                # ClickUp может вернуть value как строку или словарь/список — приведём к строке
-                best = value if isinstance(value, str) else str(value)
-                break
-
-        return best
+                return value if isinstance(value, str) else str(value)
+        return None
 
     def _normalize_task(self, task: Dict[str, Any], field_map: Dict[str, str]) -> Dict[str, Any]:
-        """
-        Приводим задачу к нашему «лиду».
-        Возвращаем:
-          - task_id
-          - clinic_name (из name)
-          - status
-          - email (если нашли)
-        """
-        task_id = str(task.get("id"))
-        name = task.get("name") or ""
-        status = (task.get("status") or {}).get("status") or ""
-        email_val = self._task_email_from_custom_fields(task, field_map)
         return {
-            "task_id": task_id,
-            "clinic_name": name,
-            "status": status,
-            "email": email_val,
+            "task_id": str(task.get("id")),
+            "clinic_name": task.get("name") or "",
+            "status": (task.get("status") or {}).get("status") or "",
+            "email": self._task_email_from_custom_fields(task, field_map),
         }
 
     def get_list_tasks_raw(self, list_id: str) -> List[Dict[str, Any]]:
-        """
-        Сырые задачи листа (включая закрытые).
-        """
         url = f"{self.BASE_URL}/list/{list_id}/task"
-        params = {
-            "include_closed": "true",
-            "subtasks": "true",
-            "page": 0,
-        }
+        params = {"include_closed": "true", "subtasks": "true", "page": 0}
         data = self._get(url, params=params)
         return data.get("tasks", []) or []
 
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        """
-        Нормализованные лиды из листа.
-        """
         field_map = self._list_custom_fields_map(list_id)
-        tasks = self.get_list_tasks_raw(list_id)
-        return [self._normalize_task(t, field_map) for t in tasks]
+        return [self._normalize_task(t, field_map) for t in self.get_list_tasks_raw(list_id)]
 
     def move_lead_to_status(self, task_id: str, status: str) -> None:
-        """
-        Переводит задачу в указанный статус.
-        """
         url = f"{self.BASE_URL}/task/{task_id}"
-        payload = {"status": status}
-        self._put(url, payload)
+        self._put(url, {"status": status})
 
     def _all_state_lists(self) -> List[str]:
-        """
-        Возвращает list_id всех листов LEADS-* в текущем Space.
-        """
         ids: List[str] = []
         for lst in self._lists_in_space():
-            name = (lst.get("name") or "")
-            if name.startswith("LEADS-"):
+            if (lst.get("name") or "").startswith("LEADS-"):
                 ids.append(str(lst.get("id")))
         return ids
 
     def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
-        """
-        Находит первую задачу по email среди всех листов LEADS-* текущего Space.
-        Возвращает нормализованный dict (как в get_leads_from_list) либо None.
-        """
         email_lc = (email_addr or "").strip().lower()
         if not email_lc:
             return None
-
         for list_id in self._all_state_lists():
             field_map = self._list_custom_fields_map(list_id)
             for task in self.get_list_tasks_raw(list_id):
@@ -237,11 +176,12 @@ class ClickUpClient:
 # Глобальный инстанс
 clickup_client = ClickUpClient()
 
-# Экспортируем константы, чтобы другие модули могли импортировать:
+# Экспортируем то, что используют другие модули
 __all__ = [
     "clickup_client",
     "NEW_STATUS",
     "READY_STATUS",
     "SENT_STATUS",
+    "INVALID_STATUS",
     "REPLIED_STATUS",
 ]
