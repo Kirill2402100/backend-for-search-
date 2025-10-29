@@ -2,7 +2,7 @@
 import os
 import threading
 import logging
-from typing import Dict, Any
+from typing import Any, Dict
 
 import requests
 from fastapi import FastAPI, Request
@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from config import settings
 from telegram_bot import handle_update
-from telegram_poller import start_polling, register_commands
+from telegram_poller import start_polling  # <-- только start_polling, без register_commands
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
@@ -22,7 +22,7 @@ BOT_TOKEN = settings.TELEGRAM_BOT_TOKEN
 
 
 def _truthy(val: Any) -> bool:
-    """Корректно приводим значение из ENV к bool."""
+    """Надёжно приводим значение из ENV к bool."""
     s = str(val).strip().lower()
     return s in ("1", "true", "yes", "y", "on")
 
@@ -37,13 +37,14 @@ def _delete_webhook() -> None:
 
 
 def _set_commands() -> None:
+    """Регистрируем команды в меню Telegram (без зависимостей от telegram_poller)."""
     try:
         payload = {
             "commands": [
                 {"command": "menu", "description": "Открыть меню со штатами"},
                 {"command": "help", "description": "Справка по командам"},
                 {"command": "search", "description": "Сбор/лист для штата: /search NY"},
-                {"command": "send", "description": "Отправить N писем: /send 50  (или /send NY 50)"},
+                {"command": "send", "description": "Отправить N писем: /send 50 (или /send NY 50)"},
                 {"command": "stats", "description": "Статистика по штату: /stats NY"},
                 {"command": "replies", "description": "Разобрать входящие ответы"},
             ]
@@ -57,25 +58,13 @@ def _set_commands() -> None:
 
 @app.on_event("startup")
 def on_startup() -> None:
-    # 1) Зарегистрируем команды (в боте появится меню автоподстановки)
-    try:
-        register_commands()
-    except TypeError:
-        # на случай старой сигнатуры register_commands() без аргументов
-        try:
-            register_commands()  # noqa: FBT003
-        except Exception as e:  # pragma: no cover
-            log.warning("register_commands error: %s", e)
-    except Exception as e:
-        log.warning("register_commands error: %s", e)
-
-    # Дублируем через прямой REST на всякий случай
+    # 1) Регистрируем команды
     _set_commands()
 
-    # 2) Гасим вебхук (если вдруг был включён) — иначе getUpdates не работает
+    # 2) На всякий случай выключаем webhook (иначе getUpdates не работает)
     _delete_webhook()
 
-    # 3) Запускаем polling, если включён флагом
+    # 3) Стартуем polling, если включён флагом
     enabled_env = os.getenv("TELEGRAM_POLLING", getattr(settings, "TELEGRAM_POLLING", "0"))
     polling_enabled = _truthy(enabled_env)
     if polling_enabled:
@@ -98,7 +87,7 @@ def root():
 
 @app.post("/tg/webhook")
 async def tg_webhook(req: Request):
-    """Эндпоинт на будущее — если решите вернуться к webhook-режиму."""
+    """Оставлен на будущее: если решите вернуться к webhook-режиму."""
     try:
         upd: Dict[str, Any] = await req.json()
     except Exception:
