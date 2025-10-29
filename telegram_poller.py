@@ -2,80 +2,58 @@
 import time
 import requests
 from typing import Dict, Any
-
 from config import settings
 from telegram_bot import handle_update
-from telegram_notifier import TELEGRAM_API_BASE
 
+TELEGRAM_API_BASE = "https://api.telegram.org/bot"
 
 def _delete_webhook(token: str) -> None:
-    # на всякий случай снимем вебхук, чтобы polling точно работал
     try:
-        requests.get(f"{TELEGRAM_API_BASE}/bot{token}/deleteWebhook",
-                     params={"drop_pending_updates": True}, timeout=10)
-    except Exception:
-        pass
-
-
-def register_commands(token: str) -> None:
-    """
-    Регистрируем команды, чтобы в Telegram появилось меню.
-    Делается один раз при старте.
-    """
-    cmds = {
-        "commands": [
-            {"command": "menu",   "description": "Открыть меню"},
-            {"command": "help",   "description": "Справка по командам"},
-            {"command": "search", "description": "Сбор по штату: /search NY"},
-            {"command": "send",   "description": "Отправить N писем: /send 50"},
-            {"command": "status", "description": "Статистика по лидам"}
-        ],
-        "scope": {"type": "default"}
-    }
-    try:
-        requests.post(
-            f"{TELEGRAM_API_BASE}/bot{token}/setMyCommands",
-            json=cmds,
-            timeout=10
-        )
-    except Exception:
-        pass
-
+        r = requests.get(f"{TELEGRAM_API_BASE}{token}/deleteWebhook", timeout=10)
+        print("[TG] deleteWebhook:", r.status_code, r.text)
+    except Exception as e:
+        print("[TG] deleteWebhook error:", e)
 
 def start_polling() -> None:
     """
-    Простой лонг-поллинг в отдельном потоке.
-    Если вебхук был включён — polling не будет получать апдейты,
-    поэтому снимаем вебхук перед стартом.
+    Long-polling цикл. Перед стартом всегда выключаем webhook.
     """
     token = settings.TELEGRAM_BOT_TOKEN
-    poll_delay_sec = int(getattr(settings, "TELEGRAM_POLLING_INTERVAL", 2))
+    if not token:
+        print("[TG] No TELEGRAM_BOT_TOKEN provided.")
+        return
 
-    _delete_webhook(token)       # на всякий случай
-    register_commands(token)     # выставим меню
+    poll_delay = int(getattr(settings, "TELEGRAM_POLLING_INTERVAL", 2))
+
+    # На всякий случай выключаем webhook
+    _delete_webhook(token)
 
     offset = 0
+    print("[TG] Long-polling started")
+
     while True:
         try:
             resp = requests.get(
-                f"{TELEGRAM_API_BASE}/bot{token}/getUpdates",
-                params={"timeout": 30, "offset": offset, "allowed_updates": ["message"]},
+                f"{TELEGRAM_API_BASE}{token}/getUpdates",
+                params={"timeout": 30, "offset": offset + 1},
                 timeout=35,
             )
             if resp.status_code != 200:
-                time.sleep(poll_delay_sec)
+                print("[TG] getUpdates:", resp.status_code, resp.text)
+                time.sleep(poll_delay)
                 continue
 
             data: Dict[str, Any] = resp.json()
             for upd in data.get("result", []):
-                # обрабатываем апдейт
+                offset = max(offset, upd.get("update_id", 0))
                 try:
+                    print("[TG] update:", upd.get("update_id"))
                     handle_update(upd)
-                except Exception:
-                    pass
-                # ВАЖНО: сдвигаем offset на последний update_id + 1
-                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                except Exception as e:
+                    print("[TG] handle_update error:", e, "upd:", upd)
 
-        except Exception:
-            time.sleep(poll_delay_sec)
-            continue
+            time.sleep(poll_delay)
+
+        except Exception as e:
+            print("[TG] poll loop error:", e)
+            time.sleep(poll_delay)
