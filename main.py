@@ -1,91 +1,77 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from typing import Optional
-
-# наше
-from config import settings
-from clickup_client import clickup_client
-from email_validator import validate_email_if_needed
-from send import router as send_router
-from telegram_bot import handle_update
-
-# polling (без вебхука), включаем по TELEGRAM_POLLING=1
+from typing import Any, Dict, Optional
 import threading
-try:
-    from telegram_poller import start_polling
-except Exception:
-    start_polling = None  # если файла нет — просто игнорируем
+
+from fastapi import FastAPI, Request, HTTPException
+
+from config import settings
+from telegram_bot import handle_update
+from telegram_poller import start_polling, register_commands
 
 
-app = FastAPI(title="TapGrow Backend")
-
-# Роуты рассылки (POST /send-proposals)
-app.include_router(send_router)
-
-
-class LeadIn(BaseModel):
-    state: str
-    clinic_name: str
-    website: Optional[str] = None
-    email: Optional[str] = None
-    source: str = "facebook"
+app = FastAPI(title="backend-for-search", version="1.0.0")
 
 
 @app.get("/health")
-def health():
+def health() -> Dict[str, Any]:
     return {"ok": True}
 
 
-@app.post("/lead/from_fb")
-def add_lead(lead: LeadIn):
-    """
-    Добавить/обновить лид в ClickUp из скрипта сбора (FB/Google/Yelp и т.д.)
-    В описание кладём website/email/source и помечаем результат валидации email (если есть).
-    """
-    is_valid = None
-    if lead.email:
-        is_valid = validate_email_if_needed(lead.email)
-
-    task_id = clickup_client.create_or_update_lead(
-        state=lead.state,
-        clinic_name=lead.clinic_name,
-        website=lead.website,
-        email=lead.email,
-        source=lead.source,
-        extra_fields={"validated": is_valid},
-    )
-    return {"clickup_task_id": task_id, "email_valid": is_valid}
-
-
-# --- Telegram: Webhook обработчик (опционально, если используешь вебхук) ---
 @app.post("/tg/webhook")
-async def tg_webhook(request: Request, secret: str):
+async def tg_webhook(request: Request, secret: Optional[str] = None) -> Dict[str, Any]:
     """
-    Endpoint для Telegram webhook: /tg/webhook?secret=<TELEGRAM_WEBHOOK_SECRET>
-    Если секрет не совпадает — 403.
+    Опциональная конечная точка для режима Webhook.
+    Работает только если query-параметр ?secret= совпадает с TELEGRAM_WEBHOOK_SECRET.
+    Телеграм отправляет JSON 'update' — пробрасываем его в handle_update().
     """
-    if secret != getattr(settings, "TELEGRAM_WEBHOOK_SECRET", "dev"):
-        raise HTTPException(status_code=403, detail="forbidden")
-    update = await request.json()
-    return handle_update(update)
+    expected = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", None)
+    if not expected:
+        # вебхук не включён конфигом
+        raise HTTPException(status_code=404, detail="Webhook disabled")
+
+    if secret != expected:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    update: Dict[str, Any] = await request.json()
+    try:
+        handle_update(update)
+    except Exception as e:
+        # не ломаем ответ Телеграму
+        print(f"[webhook] handle_update error: {e}")
+    return {"ok": True}
 
 
-# --- Telegram: Polling запуск при старте приложения (если включён) ---
+@app.get("/")
+def root() -> Dict[str, Any]:
+    """
+    Простой корневой эндпоинт, чтобы быстро понять, что сервис жив,
+    и какой режим бота включён.
+    """
+    return {
+        "service": "backend-for-search",
+        "polling": str(getattr(settings, "TELEGRAM_POLLING", "0")),
+        "webhook_enabled": bool(getattr(settings, "TELEGRAM_WEBHOOK_SECRET", None)),
+    }
+
+
 @app.on_event("startup")
-def _start_polling_if_enabled():
+def on_startup() -> None:
     """
-    Включает long-polling, если TELEGRAM_POLLING=1.
-    Одновременно webhook и polling использовать не нужно:
-    - если включён webhook, сначала выключи его:
-      https://api.telegram.org/bot<token>/deleteWebhook?drop_pending_updates=true
+    1) Регистрируем команды бота (меню) в Telegram.
+    2) Если TELEGRAM_POLLING=1 — запускаем long-polling в отдельном потоке.
     """
-    if str(getattr(settings, "TELEGRAM_POLLING", "0")) == "1" and start_polling:
-        t = threading.Thread(target=start_polling, daemon=True)
-        t.start()
+    try:
+        register_commands(settings.TELEGRAM_BOT_TOKEN)
+        print("[startup] Telegram commands registered")
+    except Exception as e:
+        print(f"[startup] register_commands error: {e}")
 
-
-# Локальный запуск (удобно для отладки)
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    if str(getattr(settings, "TELEGRAM_POLLING", "0")) == "1":
+        try:
+            t = threading.Thread(target=start_polling, daemon=True)
+            t.start()
+            print("[startup] Telegram polling started")
+        except Exception as e:
+            print(f"[startup] start_polling error: {e}")
+    else:
+        print("[startup] Polling disabled (set TELEGRAM_POLLING=1 to enable)")
