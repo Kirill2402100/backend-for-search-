@@ -1,31 +1,36 @@
+# telegram_notifier.py
+import logging
 import requests
 from typing import Optional, Dict, Any
 from config import settings
 
+logger = logging.getLogger("app")
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
+def send_message(
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = "HTML",
+    reply_markup: Optional[Dict[str, Any]] = None,
+    disable_web_page_preview: bool = True,
+) -> None:
+    """
+    Универсальная отправка сообщений в Telegram.
+    Поддерживает parse_mode и reply_markup (клавиатуру).
+    """
+    token = settings.TELEGRAM_BOT_TOKEN
+    url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
 
-def _request(method: str, payload: Dict[str, Any]) -> bool:
-    url = f"{TELEGRAM_API_BASE}/bot{settings.TELEGRAM_BOT_TOKEN}/{method}"
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> bool:
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": disable_web_page_preview,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    return _request("sendMessage", payload)
 
-
-def send_telegram_message(text: str) -> bool:
-    # отправка в фиксированный чат из настроек
-    return send_message(int(settings.TELEGRAM_CHAT_ID), text)
+    r = requests.post(url, json=payload, timeout=15)
+    if r.status_code != 200:
+        logger.warning("[tg] sendMessage failed: %s %s", r.status_code, r.text)
