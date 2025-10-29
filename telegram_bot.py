@@ -1,19 +1,13 @@
 # telegram_bot.py
-from typing import Dict, Any, Optional, List
-import imaplib
-import email
-
-from config import settings
+from typing import Dict, Any, List
 from clickup_client import clickup_client, READY_STATUS, SENT_STATUS, REPLIED_STATUS
-from telegram_notifier import send_message as tg_send
+from telegram_notifier import send_message
 from send import run_send
+from email_validator import validate_email_if_needed
+from config import settings
 
-# Нужен poller'у (deleteWebhook/getUpdates)
-TELEGRAM_API_BASE = "https://api.telegram.org"
+from leads import upsert_leads_for_state  # <-- важно
 
-# ------------------------
-# Штаты и клавиатура
-# ------------------------
 US_STATES = [
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
     "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
@@ -22,29 +16,16 @@ US_STATES = [
     "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
 ]
 
-# «Память» выбранного штата по chat_id на время жизни процесса
 USER_STATE: Dict[int, str] = {}
 
 
-def _allowed_chat(chat_id: int) -> bool:
-    """
-    Если TELEGRAM_CHAT_ID задан — отвечаем только ему.
-    Если пусто — отвечаем всем (удобно для отладки).
-    """
-    want = str(getattr(settings, "TELEGRAM_CHAT_ID", "")).strip()
-    return (not want) or (str(chat_id) == want)
-
-
 def _states_keyboard() -> Dict[str, Any]:
-    rows: List[List[Dict[str, str]]] = []
-    row: List[Dict[str, str]] = []
+    rows, row = [], []
     for i, s in enumerate(US_STATES, start=1):
         row.append({"text": s})
         if i % 5 == 0:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+            rows.append(row); row = []
+    if row: rows.append(row)
     return {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": False}
 
 
@@ -53,19 +34,16 @@ def _parse_cmd(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-# ------------------------
-# Бизнес-логика
-# ------------------------
 def _stats_for_state(state: str) -> str:
     list_id = clickup_client.get_or_create_list_for_state(state)
     leads = clickup_client.get_leads_from_list(list_id)
 
     total = len(leads)
-    with_email = sum(1 for l in leads if l.get("email"))
+    with_email = sum(1 for l in leads if (l.get("email") or "").strip())
     no_email = total - with_email
     sent = sum(1 for l in leads if l.get("status") == SENT_STATUS)
     ready = sum(1 for l in leads if l.get("status") == READY_STATUS)
-    remain = sum(1 for l in leads if (l.get("email") and l.get("status") != SENT_STATUS))
+    remain = sum(1 for l in leads if ((l.get("email") or "").strip() and l.get("status") != SENT_STATUS))
 
     return (
         f"<b>Статистика {state}</b>\n"
@@ -79,10 +57,22 @@ def _stats_for_state(state: str) -> str:
 
 
 def _handle_collect(chat_id: int, state: str) -> None:
-    # Сейчас просто гарантируем наличие листа и показываем сводку
+    # 1) создаём/находим лист и статусы
     list_id = clickup_client.get_or_create_list_for_state(state)
-    stats = _stats_for_state(state)
-    tg_send(chat_id, f"Лист для штата <b>{state}</b> готов (list_id={list_id}).\n\n{stats}", parse_mode="HTML")
+    send_message(chat_id, f"Начинаю сбор по <b>{state}</b>… (list_id={list_id})")
+
+    # 2) сбор лидов и апсерты
+    report = upsert_leads_for_state(state)
+    send_message(
+        chat_id,
+        f"Сбор завершён: <b>{state}</b>\n"
+        f"Найдено: {report['collected']}\n"
+        f"Создано новых: {report['created']}\n"
+        f"Пропущено (дубликаты/ошибки): {report['skipped']}"
+    )
+
+    # 3) финальная сводка
+    send_message(chat_id, _stats_for_state(state))
 
 
 def _handle_send(chat_id: int, state: str, limit: int) -> None:
@@ -96,121 +86,20 @@ def _handle_send(chat_id: int, state: str, limit: int) -> None:
         f"Осталось (с email, не отправлено): {report['remaining_unsent']}\n"
         f"Всего в листе: {report['total_in_list']}"
     )
-    tg_send(chat_id, text, parse_mode="HTML")
+    send_message(chat_id, text)
 
 
-def _imap_fetch_unseen_froms(n_last: int = 50) -> List[str]:
-    """Читаем INBOX/UNSEEN и возвращаем список email-адресов отправителей."""
-    host = getattr(settings, "SMTP_HOST", "mail.adm.tools")
-    username = settings.SMTP_USERNAME
-    password = settings.SMTP_PASSWORD
-
-    out: List[str] = []
-    M = imaplib.IMAP4_SSL(host, 993)
-    M.login(username, password)
-    M.select("INBOX")
-    status, data = M.search(None, "UNSEEN")
-    if status != "OK":
-        M.logout()
-        return out
-
-    ids = data[0].split()[-n_last:]
-    for msg_id in ids:
-        typ, msg_data = M.fetch(msg_id, "(RFC822)")
-        if typ != "OK":
-            continue
-        msg = email.message_from_bytes(msg_data[0][1])
-        from_hdr = email.utils.parseaddr(msg.get("From"))[1]
-        out.append(from_hdr)
-        # помечаем как прочитанное
-        M.store(msg_id, "+FLAGS", "\\Seen")
-    M.logout()
-    return out
-
-
-def _handle_replies(chat_id: int) -> None:
-    """Переносим задачи с ответами в статус REPLIED_STATUS и уведомляем."""
-    from_list = _imap_fetch_unseen_froms()
-    if not from_list:
-        tg_send(chat_id, "Новых ответов нет.")
-        return
-
-    moved = 0
-    for addr in from_list:
-        task = clickup_client.find_task_by_email(addr)
-        if task:
-            clickup_client.move_lead_to_status(task["task_id"], REPLIED_STATUS)
-            moved += 1
-            tg_send(
-                chat_id,
-                f"Ответ от <b>{task['clinic_name']}</b> ({addr}). Перенесено в «{REPLIED_STATUS}».",
-                parse_mode="HTML",
-            )
-    if moved == 0:
-        tg_send(chat_id, "Ответы получены, но соответствующие задачи не найдены.")
-
-
-def _help_text() -> str:
-    return (
-        "Команды:\n"
-        "/menu — клавиатура штатов\n"
-        "/collect NY — создать лист и показать статистику (синоним: /search NY)\n"
-        "/send NY 10 — отправить письма (limit) или /send 10 (если штат выбран)\n"
-        "/stats NY — сводка по штату\n"
-        "/replies — обработать входящие ответы\n"
-        "/id — показать ваш chat id"
-    )
-
-
-# ------------------------
-# Регистрация команд в меню Telegram
-# ------------------------
-def register_commands() -> None:
-    token = settings.TELEGRAM_BOT_TOKEN
-    if not token:
-        return
-    try:
-        import requests
-        commands = [
-            {"command": "menu",    "description": "Клавиатура штатов"},
-            {"command": "help",    "description": "Справка по командам"},
-            {"command": "id",      "description": "Показать мой chat id"},
-            {"command": "collect", "description": "Создать лист и сводку по штату"},
-            {"command": "search",  "description": "Алиас для /collect"},
-            {"command": "send",    "description": "Отправить письма"},
-            {"command": "stats",   "description": "Статистика по штату"},
-            {"command": "replies", "description": "Обработать входящие ответы"},
-        ]
-        r = requests.post(
-            f"{TELEGRAM_API_BASE}/bot{token}/setMyCommands",
-            json={"commands": commands},
-            timeout=10,
-        )
-        print(f"[tg] setMyCommands: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        print(f"[tg] setMyCommands error: {e}")
-
-
-# ------------------------
-# Обработчик апдейтов (для poller и/или вебхука)
-# ------------------------
 def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return {"ok": True}
 
-    chat_id = msg.get("chat", {}).get("id")
+    chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
 
-    if not chat_id or not text:
-        return {"ok": True}
-    if not _allowed_chat(chat_id):
-        return {"ok": True}
-
-    # выбор штата кнопкой
-    if text.upper() in US_STATES:
-        USER_STATE[chat_id] = text.upper()
-        tg_send(chat_id, f"Штат выбран: <b>{text.upper()}</b>", parse_mode="HTML")
+    if text in US_STATES:
+        USER_STATE[chat_id] = text
+        send_message(chat_id, f"Штат выбран: <b>{text}</b>")
         return {"ok": True}
 
     parts = _parse_cmd(text)
@@ -220,34 +109,38 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     cmd = parts[0].lower()
 
     if cmd in ("/start", "/help"):
-        tg_send(chat_id, _help_text())
-        return {"ok": True}
-
-    if cmd == "/id":
-        tg_send(chat_id, f"Ваш chat id: <code>{chat_id}</code>", parse_mode="HTML")
+        send_message(
+            chat_id,
+            "Команды:\n"
+            "/menu — клавиатура штатов\n"
+            "/collect NY — создать лист и собрать лидов (синоним: /search NY)\n"
+            "/send NY 10 — отправить письма (limit) или /send 10 (если штат выбран)\n"
+            "/stats NY — сводка по штату\n"
+            "/replies — обработать входящие ответы\n"
+            "/id — показать ваш chat id"
+        )
         return {"ok": True}
 
     if cmd == "/menu":
-        tg_send(chat_id, "Выбери штат, затем используй /collect, /send, /stats", reply_markup=_states_keyboard())
+        send_message(chat_id, "Выбери штат, затем используй /collect, /send, /stats", reply_markup=_states_keyboard())
         return {"ok": True}
 
     if cmd in ("/collect", "/search"):
         state = (parts[1].upper() if len(parts) > 1 else USER_STATE.get(chat_id))
         if not state or state not in US_STATES:
-            tg_send(chat_id, "Укажи штат: /collect NY или выбери через /menu")
+            send_message(chat_id, "Укажи штат: /collect NY или выбери через /menu")
             return {"ok": True}
         _handle_collect(chat_id, state)
         return {"ok": True}
 
     if cmd == "/send":
-        # /send NY 1  или  /send 1 (если штат уже выбран)
         if len(parts) == 3:
             state = parts[1].upper()
             lim = int(parts[2])
         else:
             state = USER_STATE.get(chat_id)
             if not state:
-                tg_send(chat_id, "Сначала укажи штат: /send NY 1 или выбери через /menu")
+                send_message(chat_id, "Сначала укажи штат: /send NY 1 или выбери через /menu")
                 return {"ok": True}
             lim = int(parts[1]) if len(parts) > 1 else 50
         _handle_send(chat_id, state, lim)
@@ -256,15 +149,14 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     if cmd == "/stats":
         state = (parts[1].upper() if len(parts) > 1 else USER_STATE.get(chat_id))
         if not state or state not in US_STATES:
-            tg_send(chat_id, "Укажи штат: /stats NY или выбери через /menu")
+            send_message(chat_id, "Укажи штат: /stats NY или выбери через /menu")
             return {"ok": True}
-        tg_send(chat_id, _stats_for_state(state), parse_mode="HTML")
+        send_message(chat_id, _stats_for_state(state))
         return {"ok": True}
 
-    if cmd == "/replies":
-        _handle_replies(chat_id)
+    if cmd == "/id":
+        send_message(chat_id, f"Ваш chat_id: <code>{chat_id}</code>")
         return {"ok": True}
 
-    # По умолчанию — подсказка
-    tg_send(chat_id, "Не понимаю команду. Напиши /help")
+    send_message(chat_id, "Не понимаю команду. Напиши /help")
     return {"ok": True}
