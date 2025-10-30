@@ -73,8 +73,8 @@ class ClickUpClient:
 
     def _set_pipeline_like_ny(self, list_id: str) -> None:
         """
-        ВАЖНО: у ClickUp статусы меняются через PUT /list/{id}, а не через /list/{id}/field.
-        Здесь мы насильно ставим наш набор: NEW, READY, SENT, REPLIED, INVALID.
+        Ставим свой набор статусов через правильный эндпоинт:
+        PUT /list/{id}
         """
         url = f"{CLICKUP_BASE}/list/{list_id}"
         payload = {
@@ -191,7 +191,7 @@ class ClickUpClient:
                 target_name,
             )
 
-            # КЛЮЧЕВОЕ: даже после шаблона ставим свои статусы
+            # ставим свои статусы + создаём поля
             self._set_pipeline_like_ny(new_id)
             self._ensure_required_fields(new_id)
             return new_id
@@ -210,11 +210,6 @@ class ClickUpClient:
 
     # ------------- tasks -------------
 
-    def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        url = f"{CLICKUP_BASE}/list/{list_id}/task"
-        data = self._get(url, params={"subtasks": "true"})
-        return data.get("tasks", [])
-
     def create_task(
         self,
         list_id: str,
@@ -223,13 +218,17 @@ class ClickUpClient:
         status: str = NEW_STATUS,
         custom_fields: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
+        """
+        Создаём таску. Если ClickUp вернул "Status not found" (CRTSK_001),
+        пробуем повторно БЕЗ статуса — это защищает нас от гонки,
+        когда мы только что заменили статусы на листе.
+        """
         url = f"{CLICKUP_BASE}/list/{list_id}/task"
-        payload: Dict[str, Any] = {
+        base_payload: Dict[str, Any] = {
             "name": name,
-            "status": status,
         }
         if description:
-            payload["description"] = description
+            base_payload["description"] = description
 
         cf_list: List[Dict[str, Any]] = []
         if custom_fields:
@@ -237,23 +236,40 @@ class ClickUpClient:
                 if fid:
                     cf_list.append({"id": fid, "value": val})
         if cf_list:
-            payload["custom_fields"] = cf_list
+            base_payload["custom_fields"] = cf_list
+
+        # 1. пробуем со статусом
+        payload_with_status = dict(base_payload)
+        payload_with_status["status"] = status
 
         try:
-            resp = self._post(url, payload)
+            resp = self._post(url, payload_with_status)
             task_id = resp.get("id")
             if task_id:
                 log.info("clickup:created lead task %s on list %s (%s)", task_id, list_id, name)
             return task_id
         except ClickUpError as e:
-            if "FIELD_033" in str(e):
+            txt = str(e)
+            # "Status not found" или "CRTSK_001" — пробуем повторно без статуса
+            if "Status not found" in txt or "CRTSK_001" in txt:
+                log.warning(
+                    "clickup:create task on list %s failed because status not found -> retrying without status",
+                    list_id,
+                )
+                resp = self._post(url, base_payload)
+                return resp.get("id")
+            # лимит по кастомным полям — шлём без них
+            if "FIELD_033" in txt:
                 log.warning(
                     "clickup:custom field limit reached on list %s -> creating task without custom fields",
                     list_id,
                 )
-                payload.pop("custom_fields", None)
-                resp = self._post(url, payload)
+                payload_no_cf = dict(base_payload)
+                payload_no_cf.pop("custom_fields", None)
+                # можно и со статусом, и без — возьмём без, чтобы не нарваться второй раз
+                resp = self._post(url, payload_no_cf)
                 return resp.get("id")
+            # остальные ошибки — дальше
             raise
 
     def update_task_status(self, task_id: str, status: str) -> None:
@@ -273,6 +289,7 @@ class ClickUpClient:
             if (t.get("name") or "").strip().lower() == clinic_name.lower():
                 return False
 
+        # id полей (или None, если не дали создать)
         field_ids = self._ensure_required_fields(list_id)
 
         custom_values = {
