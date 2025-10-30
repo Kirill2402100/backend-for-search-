@@ -1,217 +1,214 @@
 # leads.py
+"""
+Сбор лидов по штату из внешних источников.
+Сейчас: только Google Places API (New).
+
+Логика:
+1. по штату создаём/получаем лист в ClickUp (делает clickup_client);
+2. забираем существующие задачи из этого листа, чтобы не плодить дубли;
+3. идём в Google Places API (New) и собираем клиники по запросу "dental clinic in <STATE>, USA";
+4. по каждой найденной создаём/апдейтим задачу в ClickUp.
+
+Если Google выключен / не включен биллинг / не тот API → просто вернём пустой список,
+но бот всё равно пришлёт понятный отчёт.
+"""
+
+from __future__ import annotations
+
 import logging
-import re
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 import requests
 
 from config import settings
-from clickup_client import (
-    clickup_client,
-    READY_STATUS,
-    NEW_STATUS,
-)
+from clickup_client import clickup_client, READY_STATUS
 
-logger = logging.getLogger("leads")
+log = logging.getLogger("leads")
 
+# какие типы/категории будем спрашивать у гугла
+GOOGLE_QUERY_TEMPLATE = "dental clinic in {state}, USA"
 
-GOOGLE_PLACES_API_KEY = getattr(settings, "GOOGLE_PLACES_API_KEY", "").strip()
-
-# простейшая нормализация телефона, чтобы можно было сравнивать
-_phone_clean_re = re.compile(r"\D+")
+# сколько максимум заведений за раз вытаскивать (Places API New даёт пагинацию)
+GOOGLE_PAGE_SIZE = 20
 
 
-def _clean_phone(p: Optional[str]) -> str:
-    if not p:
-        return ""
-    return _phone_clean_re.sub("", p)
-
-
-def _google_places_text_search(state: str) -> List[Dict[str, Any]]:
+def _existing_keys_for_list(list_id: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     """
-    Идём в Google Places Text Search и достаём все «dentist in {state}, USA».
-    Возвращаем список place_id + базовые данные.
+    Возвращает 3 словаря по уже существующим лидам:
+      - by_web[website] = task_id
+      - by_phone[phone] = task_id
+      - by_sig["NAME|CITY"] = task_id     (на всякий — сигнатура по названию и городу)
+    Нужно, чтобы не плодить дубли.
     """
-    if not GOOGLE_PLACES_API_KEY:
-        logger.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
-        return []
-
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {
-        "query": f"dentist in {state}, USA",
-        "key": GOOGLE_PLACES_API_KEY,
-    }
-
-    results: List[Dict[str, Any]] = []
-    page = 1
-    while True:
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-        status = data.get("status")
-        if status not in ("OK", "ZERO_RESULTS"):
-            logger.warning("google textsearch status=%s data=%s", status, data)
-            break
-
-        items = data.get("results", [])
-        results.extend(items)
-
-        next_token = data.get("next_page_token")
-        if not next_token:
-            break
-
-        # у Places есть задержка между страницами
-        time.sleep(2)
-        params["pagetoken"] = next_token
-        page += 1
-        # ограничимся 3 страницами, чтобы не ушатать лимит
-        if page > 3:
-            break
-
-    return results
-
-
-def _google_place_details(place_id: str) -> Dict[str, Any]:
-    """
-    Берём подробности по place_id, чтобы достать сайт и телефон.
-    """
-    if not GOOGLE_PLACES_API_KEY:
-        return {}
-
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-    params = {
-        "place_id": place_id,
-        "key": GOOGLE_PLACES_API_KEY,
-        # нам нужен хотя бы телефон и сайт
-        "fields": "name,formatted_phone_number,website",
-    }
-    resp = requests.get(url, params=params, timeout=15)
-    data = resp.json()
-    if data.get("status") != "OK":
-        return {}
-    return data.get("result") or {}
-
-
-def _existing_keys_for_list(list_id: str):
-    """
-    Загружаем уже существующие лиды и строим 3 множества:
-    - по названию
-    - по телефону
-    - по сайту
-    чтобы не создавать дубли
-    """
-    tasks = clickup_client.get_leads_from_list(list_id)
-
-    by_name = set()
-    by_phone = set()
-    by_site = set()
+    tasks = clickup_client.get_leads_from_list(list_id)  # уже нормализованные словари
+    by_web: Dict[str, str] = {}
+    by_phone: Dict[str, str] = {}
+    by_sig: Dict[str, str] = {}
 
     for t in tasks:
-        name = (t.get("clinic_name") or "").strip().lower()
-        if name:
-            by_name.add(name)
+        tid = str(t.get("task_id") or t.get("id") or "")
+        name = (t.get("clinic_name") or t.get("name") or "").strip()
+        city = (t.get("city") or "").strip()
+        website = (t.get("website") or "").strip()
+        phone = (t.get("phone") or "").strip()
 
-        phone = _clean_phone(t.get("phone"))
+        if website:
+            by_web[website.lower()] = tid
         if phone:
-            by_phone.add(phone)
+            by_phone[phone] = tid
+        if name:
+            sig = f"{name.lower()}|{city.lower()}"
+            by_sig[sig] = tid
 
-        site = (t.get("website") or "").strip().lower()
-        if site:
-            by_site.add(site)
+    return by_web, by_phone, by_sig
 
-    return by_name, by_phone, by_site, tasks
 
+# ---------------------------------------------------------------------------
+# Google Places (New)
+# ---------------------------------------------------------------------------
+
+def _google_places_new_search(state: str) -> List[Dict[str, Any]]:
+    """
+    Обращается к Places API (New): https://places.googleapis.com/v1/places:searchText
+    Возвращает список «сырых» places.
+    """
+    api_key = settings.GOOGLE_PLACES_API_KEY
+    if not api_key:
+        log.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
+        return []
+
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": (
+            "places.id,places.displayName,places.formattedAddress,"
+            "places.websiteUri,places.nationalPhoneNumber,places.primaryType,"
+            "places.location"
+        ),
+    }
+    body = {
+        "textQuery": GOOGLE_QUERY_TEMPLATE.format(state=state),
+        "pageSize": GOOGLE_PAGE_SIZE,
+        # можно ещё languageCode/locationBias/regionCode — пока не усложняем
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=15)
+    except Exception as e:
+        log.warning("google new places request error: %s", e)
+        return []
+
+    if r.status_code != 200:
+        log.warning("google places new non-200: %s %s", r.status_code, r.text[:200])
+        return []
+
+    data = r.json()
+    places = data.get("places", [])
+    log.info("google (new) returned %s places for %s", len(places), state)
+    return places
+
+
+def _normalize_place(place: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Приводим гугловский place к нашей структуре для ClickUp.
+    """
+    name = (place.get("displayName", {}) or {}).get("text", "") or ""
+    address = place.get("formattedAddress") or ""
+    website = place.get("websiteUri") or ""
+    phone = place.get("nationalPhoneNumber") or ""
+    primary_type = place.get("primaryType") or ""
+
+    # попробуем вынуть город из адреса (очень грубо)
+    city = ""
+    if address and "," in address:
+        # "123 St, New York, NY 10001, USA"
+        parts = [p.strip() for p in address.split(",")]
+        if len(parts) >= 2:
+            city = parts[-3] if len(parts) >= 3 else parts[-2]
+
+    return {
+        "clinic_name": name,
+        "address": address,
+        "city": city,
+        "website": website,
+        "phone": phone,
+        "source": "google-places-new",
+        "status": READY_STATUS,
+        "category": primary_type,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Публичная точка для бота
+# ---------------------------------------------------------------------------
 
 def upsert_leads_for_state(state: str) -> Dict[str, Any]:
     """
-    Главная функция: вызывается из telegram_bot.
-    1. гарантируем лист
-    2. тянем из гугла
-    3. создаём новых
-    4. отдаём краткий отчёт
+    Основной вход из telegram_bot.py
+    Возвращает отчёт:
+        {
+          "found": int,
+          "created": int,
+          "skipped": int,
+          "list_id": str,
+          "stats": {...}  # что вернули из clickup_client для сводки
+        }
     """
-    state = state.upper()
+    # 1. лист под штат
     list_id = clickup_client.get_or_create_list_for_state(state)
+    log.info("start collecting for %s -> list %s", state, list_id)
 
-    found = 0
+    # 2. существующие лиды
+    by_web, by_phone, by_sig = _existing_keys_for_list(list_id)
+
+    # 3. берём из гугла
+    raw_places = _google_places_new_search(state)
+
+    found = len(raw_places)
     created = 0
     skipped = 0
 
-    # что уже есть в листе
-    by_name, by_phone, by_site, existing_tasks = _existing_keys_for_list(list_id)
+    for p in raw_places:
+        lead = _normalize_place(p)
 
-    # 1. гугл
-    google_places = _google_places_text_search(state)
-    logger.info("google returned %d places for %s", len(google_places), state)
+        # простейшая дедупликация
+        website = (lead.get("website") or "").lower()
+        phone = (lead.get("phone") or "").strip()
+        sig = f"{lead.get('clinic_name','').lower()}|{lead.get('city','').lower()}"
 
-    for place in google_places:
-        found += 1
-        name = (place.get("name") or "").strip()
-        if not name:
+        if website and website in by_web:
             skipped += 1
             continue
-
-        # если такое имя уже есть — дубликат
-        if name.lower() in by_name:
-            skipped += 1
-            continue
-
-        place_id = place.get("place_id")
-        details = _google_place_details(place_id) if place_id else {}
-
-        website = (details.get("website") or "").strip()
-        phone = _clean_phone(details.get("formatted_phone_number"))
-
-        # проверим по сайту
-        if website and website.lower() in by_site:
-            skipped += 1
-            continue
-
-        # проверим по телефону
         if phone and phone in by_phone:
             skipped += 1
             continue
+        if sig and sig in by_sig:
+            skipped += 1
+            continue
 
-        # создаём задачу
-        status = READY_STATUS if website else NEW_STATUS
-        clickup_client.create_lead_task(
-            list_id=list_id,
-            clinic_name=name,
-            website=website,
-            email_=None,  # email ты сам будешь вписывать
-            phone=phone,
-            signature=None,
-            status=status,
-        )
-
+        # создаём/апдейтим задачу в ClickUp
+        clickup_client.upsert_lead(list_id, lead)
         created += 1
-        by_name.add(name.lower())
-        if website:
-            by_site.add(website.lower())
-        if phone:
-            by_phone.add(phone)
 
-    # можно здесь же будет довесить Yelp/Zocdoc/Healthgrades
-
-    # после апдейта — перечитаем лист для статистики
-    final_tasks = clickup_client.get_leads_from_list(list_id)
-    total = len(final_tasks)
-    with_email = sum(1 for t in final_tasks if t.get("email"))
+    # 4. ещё раз берём сводку по листу (то, что ты показываешь в telegram)
+    leads_after = clickup_client.get_leads_from_list(list_id)
+    total = len(leads_after)
+    with_email = sum(1 for l in leads_after if l.get("email"))
     no_email = total - with_email
-    ready = sum(1 for t in final_tasks if t.get("status") == READY_STATUS)
-    sent = sum(1 for t in final_tasks if t.get("status") == "SENT")
-    remaining = sum(1 for t in final_tasks if (t.get("email") and t.get("status") != "SENT"))
+    ready = sum(1 for l in leads_after if l.get("status") == READY_STATUS)
+    sent = sum(1 for l in leads_after if l.get("status") == "SENT")
 
     return {
-        "state": state,
-        "list_id": list_id,
         "found": found,
         "created": created,
         "skipped": skipped,
-        "total_in_list": total,
-        "with_email": with_email,
-        "no_email": no_email,
-        "ready": ready,
-        "sent": sent,
-        "remaining_unsent": remaining,
+        "list_id": list_id,
+        "stats": {
+            "total": total,
+            "with_email": with_email,
+            "no_email": no_email,
+            "ready": ready,
+            "sent": sent,
+            "remain": max(0, with_email - sent),
+        },
     }
