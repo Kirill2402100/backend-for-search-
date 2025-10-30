@@ -12,15 +12,17 @@ CLICKUP_BASE = "https://api.clickup.com/api/v2"
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN", "")
 CLICKUP_SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "")
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
-CLICKUP_TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "")  # <- ты уже поставил NY
+# важное: это id ЛИСТА-ШАБЛОНА (у тебя сейчас это NY)
+CLICKUP_TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "")
 
-# наши статусы (ими должен пользоваться и телеграм-бот)
+# ===== статусы =====
 NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
+REPLIED_STATUS = "REPLIED"      # ← вернули, чтобы telegram_bot.py не падал
 INVALID_STATUS = "INVALID"
 
-# нужные нам кастомные поля
+# какие кастомные поля нам нужны
 REQUIRED_CUSTOM_FIELDS = {
     "Email": {"type": "text"},
     "Website": {"type": "text"},
@@ -65,16 +67,14 @@ class ClickUpClient:
     # ------------- lists -------------
 
     def _list_lists_in_space(self) -> List[Dict[str, Any]]:
-        """
-        Возвращает ВСЕ листы в указанном SPACE.
-        """
         url = f"{CLICKUP_BASE}/space/{CLICKUP_SPACE_ID}/list"
         data = self._get(url)
         return data.get("lists", [])
 
     def _set_pipeline_like_ny(self, list_id: str) -> None:
         """
-        Если не получилось создать из шаблона — навешиваем наши 4 статуса.
+        Если лист создавался НЕ из шаблона — навешиваем свои статусы.
+        Делаем 5 штук: NEW, READY, SENT, REPLIED, INVALID.
         """
         url = f"{CLICKUP_BASE}/list/{list_id}/field"
         payload = {
@@ -93,14 +93,20 @@ class ClickUpClient:
                 },
                 {
                     "status": SENT_STATUS,
-                    "type": "closed",
+                    "type": "open",
                     "orderindex": 2,
                     "color": "#20bf6b",
                 },
                 {
-                    "status": INVALID_STATUS,
+                    "status": REPLIED_STATUS,
                     "type": "closed",
                     "orderindex": 3,
+                    "color": "#0fb9b1",
+                },
+                {
+                    "status": INVALID_STATUS,
+                    "type": "closed",
+                    "orderindex": 4,
                     "color": "#eb3b5a",
                 },
             ]
@@ -109,13 +115,9 @@ class ClickUpClient:
             self._post(url, payload)
             log.info("clickup:set pipeline for list %s", list_id)
         except ClickUpError as e:
-            # не хотим, чтобы из-за этого падал весь сбор
             log.warning("clickup:cannot set pipeline on list %s: %s", list_id, e)
 
     def _list_custom_fields(self, list_id: str) -> Dict[str, str]:
-        """
-        Возвращает {FieldName: FieldId} для списка.
-        """
         url = f"{CLICKUP_BASE}/list/{list_id}/field"
         data = self._get(url)
         out: Dict[str, str] = {}
@@ -127,9 +129,6 @@ class ClickUpClient:
         return out
 
     def _create_field_on_list(self, list_id: str, name: str, ftype: str) -> Optional[str]:
-        """
-        Пробуем создать кастомное поле. Если у плана лимит — просто вернём None.
-        """
         url = f"{CLICKUP_BASE}/list/{list_id}/field"
         payload = {
             "type": ftype,
@@ -139,7 +138,7 @@ class ClickUpClient:
         try:
             resp = self._post(url, payload)
         except ClickUpError as e:
-            # типичная ошибка у тебя была: {"err":"Custom field usages exceeded for your plan","ECODE":"FIELD_033"}
+            # лимит по кастомным полям — просто логируем и идём дальше
             log.warning("clickup:cannot create field %s on list %s (%s)", name, list_id, e)
             return None
 
@@ -151,8 +150,7 @@ class ClickUpClient:
 
     def _ensure_required_fields(self, list_id: str) -> Dict[str, Optional[str]]:
         """
-        Проверяем, что на листе есть наши 5 полей. Если не даёт создать — просто вернём None.
-        Возвращаем словарь {имя поля: id или None}.
+        Проверяем/создаём 5 наших полей. Если не дали создать — значение будет None.
         """
         existing = self._list_custom_fields(list_id)
         result: Dict[str, Optional[str]] = {}
@@ -169,12 +167,12 @@ class ClickUpClient:
         state = state.upper()
         target_name = f"LEADS-{state}"
 
-        # 1. ищем уже созданный
+        # 1. пробуем найти уже существующий
         for lst in self._list_lists_in_space():
             if lst.get("name") == target_name:
                 return lst["id"]
 
-        # 2. если есть шаблон — создаём из него
+        # 2. пробуем создать из шаблона (NY)
         if CLICKUP_TEMPLATE_LIST_ID:
             url = f"{CLICKUP_BASE}/space/{CLICKUP_SPACE_ID}/list"
             payload = {
@@ -190,21 +188,18 @@ class ClickUpClient:
                 CLICKUP_TEMPLATE_LIST_ID,
                 target_name,
             )
-            # на всякий случай тоже попытаемся убедиться, что поля есть
+            # на всякий случай убедимся, что поля есть
             self._ensure_required_fields(new_id)
             return new_id
 
-        # 3. иначе — создаём обычный лист и вручную накидываем статусы
+        # 3. если шаблона нет/не сработал — создаём пустой и ставим наш pipeline
         url = f"{CLICKUP_BASE}/space/{CLICKUP_SPACE_ID}/list"
         payload = {"name": target_name, "content": ""}
         resp = self._post(url, payload)
         new_id = resp["id"]
         log.info("clickup:created list %s (%s)", new_id, target_name)
 
-        # ставим pipeline как в NY
         self._set_pipeline_like_ny(new_id)
-
-        # и пробуем добавить кастомные поля
         self._ensure_required_fields(new_id)
 
         return new_id
@@ -212,14 +207,8 @@ class ClickUpClient:
     # ------------- tasks -------------
 
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        """
-        Подтягиваем ВСЕ задачи листа. Этого хватает для наших 100–200 задач.
-        """
         url = f"{CLICKUP_BASE}/list/{list_id}/task"
-        params = {
-            "subtasks": "true",
-        }
-        data = self._get(url, params=params)
+        data = self._get(url, params={"subtasks": "true"})
         return data.get("tasks", [])
 
     def create_task(
@@ -238,11 +227,10 @@ class ClickUpClient:
         if description:
             payload["description"] = description
 
-        # если у нас есть ID кастомных полей – кладём
         cf_list: List[Dict[str, Any]] = []
         if custom_fields:
             for fid, val in custom_fields.items():
-                if fid:
+                if fid:  # может быть None, если поле не создалось
                     cf_list.append({"id": fid, "value": val})
         if cf_list:
             payload["custom_fields"] = cf_list
@@ -254,7 +242,7 @@ class ClickUpClient:
                 log.info("clickup:created lead task %s on list %s (%s)", task_id, list_id, name)
             return task_id
         except ClickUpError as e:
-            # если это лимит по кастомным полям – пробуем создать БЕЗ них
+            # если это лимит по кастомным полям — шлём без них
             if "FIELD_033" in str(e):
                 log.warning(
                     "clickup:ClickUp custom field limit reached on list %s -> creating task without custom fields",
@@ -263,33 +251,26 @@ class ClickUpClient:
                 payload.pop("custom_fields", None)
                 resp = self._post(url, payload)
                 return resp.get("id")
-            # другие ошибки – уже фатальные
             raise
 
     def update_task_status(self, task_id: str, status: str) -> None:
         url = f"{CLICKUP_BASE}/task/{task_id}"
-        payload = {"status": status}
-        self._put(url, payload)
+        self._put(url, {"status": status})
 
     # ------------- higher level -------------
 
     def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> bool:
-        """
-        Создаём задачу, если такой ещё нет.
-        Дедупим по имени клиники (этого достаточно для наших данных).
-        """
         clinic_name = (lead.get("clinic_name") or "").strip()
         if not clinic_name:
             return False
 
-        # 1. проверяем, есть ли такая уже
+        # дедуп по названию
         tasks = self.get_leads_from_list(list_id)
         for t in tasks:
             if (t.get("name") or "").strip().lower() == clinic_name.lower():
-                # уже есть – считаем, что пропустили
                 return False
 
-        # 2. получаем id кастомных полей (если не дают – вернутся None)
+        # id полей (или None, если не дали создать)
         field_ids = self._ensure_required_fields(list_id)
 
         custom_values = {
@@ -313,26 +294,26 @@ class ClickUpClient:
         self.update_task_status(task_id, status)
 
     def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
-        """
-        Простейший вариант: пройтись по ВСЕМ листам и по ВСЕМ задачам и
-        посмотреть, есть ли у кого-то custom field Email == email_addr.
-        Мы маленькие (200–300 задач), нам можно :)
-        """
-        # соберём все листы этого спейса
+        # берём все листы спейса
         lists = self._list_lists_in_space()
         for lst in lists:
             lid = lst.get("id")
             if not lid:
                 continue
+
             tasks = self.get_leads_from_list(lid)
             fields_map = self._list_custom_fields(lid)
-            # пытаемся найти id поля Email
             email_field_id = fields_map.get("Email")
+
+            if not email_field_id:
+                continue
+
             for t in tasks:
-                if not email_field_id:
-                    continue
                 for cf in t.get("custom_fields", []):
-                    if cf.get("id") == email_field_id and (cf.get("value") or "").lower() == email_addr.lower():
+                    if (
+                        cf.get("id") == email_field_id
+                        and (cf.get("value") or "").lower() == email_addr.lower()
+                    ):
                         return {
                             "task_id": t["id"],
                             "clinic_name": t.get("name") or "",
@@ -341,5 +322,4 @@ class ClickUpClient:
         return None
 
 
-# создаём синглтон, как у тебя было
 clickup_client = ClickUpClient()
