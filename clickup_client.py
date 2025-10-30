@@ -12,7 +12,7 @@ CLICKUP_BASE = "https://api.clickup.com/api/v2"
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN", "")
 CLICKUP_SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "")
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
-# он у нас есть в env, но мы его БОЛЬШЕ НЕ ИСПОЛЬЗУЕМ специально
+# он у нас есть в env, но мы его БОЛЬШЕ НЕ ИСПОЛЬЗUЕМ специально
 CLICKUP_TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "")
 
 # ===== наши статусы =====
@@ -176,9 +176,28 @@ class ClickUpClient:
     # ---------------- tasks ----------------
 
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
+        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ ПАГИНАЦИИ 🟢 =====
         url = f"{CLICKUP_BASE}/list/{list_id}/task"
-        data = self._get(url, params={"subtasks": "true"})
-        return data.get("tasks", [])
+        all_tasks: List[Dict[str, Any]] = []
+        page = 0
+
+        while True:
+            params = {
+                "subtasks": "true",
+                "page": page
+            }
+            data = self._get(url, params=params)
+            tasks = data.get("tasks", [])
+            
+            if not tasks:
+                # Если ClickUp вернул пустой список 'tasks', значит, страницы закончились
+                break
+                
+            all_tasks.extend(tasks)
+            page += 1
+            
+        return all_tasks
+        # ===== 🟢 КОНЕЦ ИСПРАВЛЕНИЯ 🟢 =====
 
     def create_task(
         self,
@@ -253,8 +272,7 @@ class ClickUpClient:
     # ---------------- higher level ----------------
 
     def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> bool:
-        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢 =====
-        # Было: lead.get("clinic_name")
+        # Это исправление мы уже сделали
         clinic_name = (lead.get("name") or "").strip()
         if not clinic_name:
             return False
