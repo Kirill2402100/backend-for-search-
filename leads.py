@@ -1,7 +1,7 @@
 # leads.py
 import os
 import logging
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional
 import requests
 
 from clickup_client import clickup_client
@@ -10,50 +10,47 @@ log = logging.getLogger("leads")
 
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
 
-# сколько страниц гугла максимум тащим за один /collect
-MAX_GOOGLE_PAGES = int(os.getenv("GOOGLE_PLACES_MAX_PAGES", "5"))
-
-# что ищем — можно будет расширить
-GOOGLE_BASE_QUERY = "dentist NY"   # потом можно подставлять штат
+# что ищем по умолчанию — ты можешь поменять на что-то другое
+BASE_QUERY_TEMPLATE = "dentist {state}"
 
 
-def _google_search_places(state: str) -> List[Dict[str, Any]]:
+def _google_search_all_places(state: str) -> List[Dict[str, Any]]:
     """
-    Ищем клиники в Google Places (New), с пагинацией.
-    Возвращаем список raw places.
+    Делаем places:searchText в Google Places (New) и забираем ВСЕ страницы,
+    пока у гугла есть nextPageToken.
     """
     if not GOOGLE_PLACES_API_KEY:
         log.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
         return []
 
     url = "https://places.googleapis.com/v1/places:searchText"
+
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        # чтобы в ответе сразу был сайт/телефон, просим нужные поля
+        # сразу просим то, что нам потенциально нужно
         "X-Goog-FieldMask": (
             "places.id,places.displayName,places.formattedAddress,"
             "places.websiteUri,places.internationalPhoneNumber"
         ),
     }
 
-    # мы можем собирать чуть точнее по штату, но пока — как было
-    text_query = f"dentist {state}"
+    text_query = BASE_QUERY_TEMPLATE.format(state=state)
 
-    body: Dict[str, Any] = {
+    base_body: Dict[str, Any] = {
         "textQuery": text_query,
     }
 
     all_places: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
-    page = 0
+    page_num = 0
 
-    while page < MAX_GOOGLE_PAGES:
-        req_body = dict(body)
+    while True:
+        body = dict(base_body)
         if page_token:
-            req_body["pageToken"] = page_token
+            body["pageToken"] = page_token
 
-        resp = requests.post(url, headers=headers, json=req_body, timeout=30)
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
         data = resp.json()
 
         if resp.status_code != 200:
@@ -63,11 +60,11 @@ def _google_search_places(state: str) -> List[Dict[str, Any]]:
         places = data.get("places", [])
         all_places.extend(places)
 
+        page_num += 1
         page_token = data.get("nextPageToken")
-        if not page_token:
-            break
 
-        page += 1
+        if not page_token:
+            break  # страниц больше нет
 
     log.info("google (new) returned %s places for %s", len(all_places), state)
     return all_places
@@ -75,12 +72,11 @@ def _google_search_places(state: str) -> List[Dict[str, Any]]:
 
 def _google_place_details(place_id: str) -> Dict[str, Any]:
     """
-    Подтягиваем детали по place_id — иногда в searchText их нет.
+    Дотягиваем детали по place_id — там бывает website и телефон.
     """
     if not GOOGLE_PLACES_API_KEY:
         return {}
 
-    # Сразу просим только нужные поля
     fields = "id,displayName,formattedAddress,websiteUri,internationalPhoneNumber"
     url = f"https://places.googleapis.com/v1/{place_id}"
     params = {
@@ -94,19 +90,19 @@ def _google_place_details(place_id: str) -> Dict[str, Any]:
     return r.json()
 
 
-def _normalize_place_to_lead(place: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_place(place: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Приводим гугловский place к нашему формату для ClickUp.
+    Приводим плейс к нашему “лиду”.
     """
-    name = (place.get("displayName", {}) or {}).get("text") or place.get("name") or "Unknown"
+    name = (place.get("displayName") or {}).get("text") or place.get("name") or "Unknown"
     website = place.get("websiteUri") or ""
     phone = place.get("internationalPhoneNumber") or ""
-    # соцсетей гугл не отдаёт — их будем тащить позже из Yelp/Zocdoc/чего-то ещё
+
     return {
         "name": name,
         "email": "",          # гугл не отдаёт
         "website": website,
-        "facebook": "",
+        "facebook": "",       # сюда будем писать из других источников
         "instagram": "",
         "linkedin": "",
         "phone": phone,
@@ -115,24 +111,27 @@ def _normalize_place_to_lead(place: Dict[str, Any]) -> Dict[str, Any]:
 
 def upsert_leads_for_state(state: str) -> Dict[str, Any]:
     """
-    Главная функция, которую вызывает /collect.
-    Создаём/обновляем всех, кого нашли, и возвращаем отчёт.
+    Главная функция, которую вызывает /collect STATE.
+    1) гарантируем лист
+    2) тянем все страницы из Google Places (New)
+    3) по каждому месту — если нужно — дотягиваем детали
+    4) upsert в ClickUp
+    5) отдаём отчёт
     """
     list_id = clickup_client.get_or_create_list_for_state(state)
     log.info("start collecting for %s -> list %s", state, list_id)
 
-    # 1. тащим гугл
-    raw_places = _google_search_places(state)
+    raw_places = _google_search_all_places(state)
 
     created = 0
     skipped = 0
 
-    for p in raw_places:
-        lead = _normalize_place_to_lead(p)
+    for place in raw_places:
+        lead = _normalize_place(place)
 
-        # если вдруг в searchText не было сайта/телефона — попробуем дотянуть
-        if not lead["website"] or not lead["phone"]:
-            pid = p.get("id")
+        # если в поиске не было сайта/телефона — пробуем дотянуть
+        if (not lead["website"]) or (not lead["phone"]):
+            pid = place.get("id")
             if pid:
                 det = _google_place_details(pid)
                 if det:
@@ -141,17 +140,16 @@ def upsert_leads_for_state(state: str) -> Dict[str, Any]:
                     if not lead["phone"]:
                         lead["phone"] = det.get("internationalPhoneNumber") or ""
 
-        # на этом шаге у нас всё ещё может не быть email — это нормально
+        # пишем в ClickUp (там уже есть защита от лимита cf)
         clickup_client.upsert_lead(list_id, lead)
         created += 1
 
-    # отчёт
     total_in_list = len(clickup_client.get_leads_from_list(list_id))
-    report = {
+
+    return {
+        "state": state,
         "found": len(raw_places),
         "created": created,
         "skipped": skipped,
         "total_in_list": total_in_list,
-        "state": state,
     }
-    return report
