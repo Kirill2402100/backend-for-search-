@@ -6,170 +6,151 @@ from typing import Any, Dict, List, Optional
 import requests
 
 log = logging.getLogger("clickup")
-logging.basicConfig(level=logging.INFO)
 
-CLICKUP_TOKEN = os.getenv("CLICKUP_API_TOKEN", "")
-SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "")
-TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
-# вот эта — теперь ОПЦИОНАЛЬНАЯ
-TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "").strip()
+CLICKUP_API_BASE = "https://api.clickup.com/api/v2"
 
-BASE_URL = "https://api.clickup.com/api/v2"
+# статусы, которые мы хотим видеть на каждом «штатном» листе
+DEFAULT_STATUSES = [
+    {"status": "NEW", "type": "open", "color": "#d3d3d3"},
+    {"status": "READY", "type": "open", "color": "#6a6ef7"},
+    {"status": "SENT", "type": "done", "color": "#3ac35f"},
+    {"status": "INVALID", "type": "closed", "color": "#f95c5c"},
+]
 
-# наши статусы
-NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
+REPLIED_STATUS = "REPLIED"  # у тебя он есть в telegram_bot
 INVALID_STATUS = "INVALID"
-REPLIED_STATUS = "REPLIED"
 
 
-def _headers() -> Dict[str, str]:
-    return {
-        "Authorization": CLICKUP_TOKEN,
-        "Content-Type": "application/json",
-    }
-
-
-class ClickUpError(Exception):
+class ClickUpError(RuntimeError):
     pass
 
 
 class ClickUpClient:
-    """
-    Обёртка вокруг ClickUp. Здесь делаем:
-    - создание листа под штат (LEADS-NY и т.п.)
-    - чтение/создание кастомных полей
-    - создание/обновление задач (лидов)
-    """
-
-    def __init__(self, space_id: str, team_id: str):
-        self.space_id = space_id
+    def __init__(
+        self,
+        token: str,
+        team_id: str,
+        space_id: str,
+        template_list_id: Optional[str] = None,
+    ) -> None:
+        self.token = token
         self.team_id = team_id
+        self.space_id = space_id
+        # это может быть ПУСТО — тогда создаём простой лист
+        self.template_list_id = (template_list_id or "").strip() or None
 
-    # ---------------------------
-    # ВСПОМОГАТЕЛЬНОЕ
-    # ---------------------------
-    def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        r = requests.get(url, headers=_headers(), params=params, timeout=15)
-        if r.status_code >= 400:
-            raise ClickUpError(f"ClickUp GET error: {r.status_code} {r.text}")
-        return r.json()
-
-    def _post(self, url: str, json: Dict[str, Any]) -> Any:
-        r = requests.post(url, headers=_headers(), json=json, timeout=15)
-        if r.status_code >= 400:
-            raise ClickUpError(f"ClickUp POST error: {r.status_code} {r.text}")
-        return r.json()
-
-    def _put(self, url: str, json: Dict[str, Any]) -> Any:
-        r = requests.put(url, headers=_headers(), json=json, timeout=15)
-        if r.status_code >= 400:
-            raise ClickUpError(f"ClickUp PUT error: {r.status_code} {r.text}")
-        return r.json()
-
-    # ---------------------------
-    # ЛИСТ ПОД ШТАТ
-    # ---------------------------
-    def get_or_create_list_for_state(self, state: str) -> str:
-        """
-        Ищем лист с именем LEADS-<STATE>.
-        Если нет — создаём. Если указан TEMPLATE_LIST_ID — создаём из него.
-        """
-        wanted_name = f"LEADS-{state}"
-
-        # 1. посмотреть все листы в спейсе
-        url = f"{BASE_URL}/space/{self.space_id}/list"
-        data = self._get(url)
-        for item in data.get("lists", []):
-            if item.get("name") == wanted_name:
-                return str(item["id"])
-
-        # 2. создавать
-        create_url = f"{BASE_URL}/space/{self.space_id}/list"
-        payload: Dict[str, Any] = {
-            "name": wanted_name,
+    # ------------- внутреннее -------------
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": self.token,
+            "Content-Type": "application/json",
         }
 
-        # если есть шаблон — укажем его
-        if TEMPLATE_LIST_ID:
-            # это не строгий “создать из шаблона” endpoint, но мы можем
-            # сразу после создания перетащить статусы/поля, поэтому просто создаём пустой
-            log.info("clickup: will create list %s and then copy from template %s", wanted_name, TEMPLATE_LIST_ID)
+    def _raise_for(self, resp: requests.Response, msg: str) -> None:
+        if not resp.ok:
+            raise ClickUpError(f"{msg}: {resp.status_code} {resp.text}")
 
-        created = self._post(create_url, payload)
-        list_id = str(created["id"])
-
-        # скопировать статусы/поля, если есть шаблон
-        if TEMPLATE_LIST_ID:
-            self._copy_fields_and_statuses_from_template(list_id, TEMPLATE_LIST_ID)
-        else:
-            log.warning("clickup: CLICKUP_TEMPLATE_LIST_ID is empty -> list %s will have default fields", list_id)
-
+    # ------------- создание листа под штат -------------
+    def _create_list_plain(self, state: str) -> str:
+        """Создаём обычный лист без шаблона."""
+        url = f"{CLICKUP_API_BASE}/space/{self.space_id}/list"
+        payload: Dict[str, Any] = {
+            "name": f"LEADS-{state}",
+            # сразу положим статусы
+            "statuses": DEFAULT_STATUSES,
+        }
+        r = requests.post(url, json=payload, headers=self._headers(), timeout=20)
+        self._raise_for(r, "ClickUp create list (plain)")
+        data = r.json()
+        list_id = str(data["id"])
         return list_id
 
-    # ---------------------------
-    # КОПИРОВАНИЕ ПОЛЕЙ/СТАТУСОВ
-    # ---------------------------
-    def _copy_fields_and_statuses_from_template(self, target_list_id: str, template_list_id: str) -> None:
+    def _create_list_from_template(self, state: str) -> Optional[str]:
+        """Пробуем создать лист на основе ТЕМПЛЕЙТА (а не живого листа)."""
+        if not self.template_list_id:
+            return None
+        url = f"{CLICKUP_API_BASE}/space/{self.space_id}/list"
+        payload: Dict[str, Any] = {
+            "name": f"LEADS-{state}",
+            "template_id": self.template_list_id,
+        }
+        r = requests.post(url, json=payload, headers=self._headers(), timeout=25)
+        if r.status_code == 200:
+            data = r.json()
+            list_id = str(data["id"])
+            # на всякий случай всё равно подмешаем наши статусы —
+            # если в шаблоне были свои, они перезапишутся нашими
+            self._ensure_statuses(list_id)
+            return list_id
+        else:
+            # тут как раз твой случай: мы передали ID живого листа,
+            # а ClickUp сказал 400 → просто логируем и вернём None
+            log.warning(
+                "ClickUp: can't create list from template_id=%s -> %s %s",
+                self.template_list_id,
+                r.status_code,
+                r.text[:200],
+            )
+            return None
+
+    def _ensure_statuses(self, list_id: str) -> None:
+        """Обновляем лист, чтобы там были нужные нам 4 статуса."""
+        url = f"{CLICKUP_API_BASE}/list/{list_id}"
+        payload = {
+            "statuses": DEFAULT_STATUSES,
+        }
+        r = requests.put(url, json=payload, headers=self._headers(), timeout=20)
+        if not r.ok:
+            log.warning("ClickUp: can't update statuses for list %s: %s %s", list_id, r.status_code, r.text[:200])
+
+    # ------------- публичное -------------
+    def get_or_create_list_for_state(self, state: str) -> str:
         """
-        В ClickUp нет простого “склонировать лист” по API, поэтому делаем так:
-        - читаем кастомные поля из шаблона
-        - читаем статусы из шаблона
-        - создаём такие же кастомные поля и статусы в целевом листе
-        Если что-то не вышло — просто логируем и продолжаем.
+        1. ищем список по имени LEADS-<STATE>
+        2. если нет — создаём
         """
-        try:
-            # кастомные поля
-            t_fields = self._list_raw_custom_fields(template_list_id)
+        # 1) получить все списки в Space
+        # (у тебя их немного, можно так)
+        url = f"{CLICKUP_API_BASE}/space/{self.space_id}/list"
+        r = requests.get(url, headers=self._headers(), timeout=20)
+        self._raise_for(r, "ClickUp get lists for space")
+        data = r.json()
+        target_name = f"LEADS-{state}"
+        for lst in data.get("lists", []):
+            if lst.get("name") == target_name:
+                list_id = str(lst["id"])
+                # и тут тоже прогоним на всякий случай статусы
+                self._ensure_statuses(list_id)
+                return list_id
 
-            for f in t_fields:
-                self._ensure_custom_field(target_list_id, f)
+        # 2) не нашли → создаём
+        # сначала — из шаблона, если дали нормальный template_id
+        list_id = self._create_list_from_template(state)
+        if list_id:
+            return list_id
 
-            # статусы
-            t_statuses = self._get(f"{BASE_URL}/list/{template_list_id}")
-            statuses = t_statuses.get("statuses") or []
-            if statuses:
-                self._put(
-                    f"{BASE_URL}/list/{target_list_id}",
-                    {"statuses": statuses},
-                )
-        except Exception as e:
-            log.warning("clickup: copy from template failed: %s", e)
+        # если не вышло — обычный
+        return self._create_list_plain(state)
 
-    def _list_raw_custom_fields(self, list_id: str) -> List[Dict[str, Any]]:
-        # официальный endpoint “Get Accessible Custom Fields”:
-        url = f"{BASE_URL}/list/{list_id}/field"
-        data = self._get(url)
-        return data if isinstance(data, list) else []
-
-    def _ensure_custom_field(self, list_id: str, field_def: Dict[str, Any]) -> None:
-        """
-        Создаём в list_id поле такого же типа/названия, как в шаблоне.
-        API у ClickUp не супергладкое, поэтому делаем “best effort”.
-        """
-        try:
-            name = field_def.get("name")
-            ftype = field_def.get("type")
-            # нельзя просто передать весь объект — поэтому берём минимально
-            payload = {
-                "name": name,
-                "type": ftype,
-            }
-            self._post(f"{BASE_URL}/list/{list_id}/field", payload)
-        except Exception as e:
-            log.warning("clickup: cannot create custom field on %s: %s", list_id, e)
-
-    # ---------------------------
-    # КАРТА ПОЛЕЙ В ЛИСТЕ
-    # ---------------------------
+    # ------------- чтение -------------
     def _list_custom_fields_map(self, list_id: str) -> Dict[str, str]:
         """
-        Вернём словарь {имя_поля: id_поля} для дальнейших апдейтов.
+        Вернёт словарь:
+            { "Email": "xxxxx", "Phone": "yyyyy", ... }
+        чтобы мы могли потом сопоставлять по имени.
+        Если на листе вообще нет полей — вернём {}.
         """
+        url = f"{CLICKUP_API_BASE}/list/{list_id}/field"
+        r = requests.get(url, headers=self._headers(), timeout=20)
+        if not r.ok:
+            log.warning("ClickUp: can't fetch custom fields for list %s: %s %s", list_id, r.status_code, r.text[:200])
+            return {}
+        fields = r.json().get("fields", [])
         out: Dict[str, str] = {}
-        raw = self._list_raw_custom_fields(list_id)
-        for f in raw:
+        for f in fields:
+            # бывает, что API отдаёт просто строку — поэтому страховка
             if not isinstance(f, dict):
                 continue
             fid = str(f.get("id") or "")
@@ -178,122 +159,134 @@ class ClickUpClient:
                 out[name] = fid
         return out
 
-    # ---------------------------
-    # ЛИДЫ/ЗАДАЧИ
-    # ---------------------------
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
         """
-        Забираем ВСЕ задачи из листа.
+        Забираем ВСЕ задачи из листа (страницы пролистываем).
+        Вернём в удобном виде.
         """
-        url = f"{BASE_URL}/list/{list_id}/task"
-        params = {"subtasks": "true", "page": 0}
-        out: List[Dict[str, Any]] = []
+        tasks: List[Dict[str, Any]] = []
+        page = 0
+        field_map = self._list_custom_fields_map(list_id)
 
         while True:
-            data = self._get(url, params=params)
-            tasks = data.get("tasks", [])
-            out.extend(tasks)
-            if len(tasks) < 100:
+            url = f"{CLICKUP_API_BASE}/list/{list_id}/task"
+            r = requests.get(
+                url,
+                params={"page": page, "subtasks": "true"},
+                headers=self._headers(),
+                timeout=25,
+            )
+            self._raise_for(r, "ClickUp get tasks from list")
+            data = r.json()
+            raw_tasks = data.get("tasks", [])
+            if not raw_tasks:
                 break
-            params["page"] += 1
 
-        # обогатим задачки удобными полями
+            for t in raw_tasks:
+                item: Dict[str, Any] = {
+                    "task_id": t["id"],
+                    "name": t.get("name"),
+                    "status": (t.get("status") or {}).get("status"),
+                    "email": None,
+                    "phone": None,
+                    "website": None,
+                    # чтобы уметь искать по email
+                }
+                # вытащим из кастомных полей
+                for cf in t.get("custom_fields", []):
+                    cid = cf.get("id")
+                    val = cf.get("value")
+                    if not cid or val is None:
+                        continue
+                    # пробуем по имени
+                    for field_name, field_id in field_map.items():
+                        if cid == field_id:
+                            if field_name.lower().startswith("email"):
+                                item["email"] = val
+                            elif field_name.lower().startswith("phone") or field_name.lower().startswith("тел"):
+                                item["phone"] = val
+                            elif field_name.lower().startswith("url"):
+                                item["website"] = val
+                tasks.append(item)
+
+            page += 1
+
+        return tasks
+
+    # ------------- upsert таски -------------
+    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> str:
+        """
+        Создаёт (или обновляет) задачу для одной клиники.
+        Сейчас делаем «create always», т.к. в leads.py мы и так отсеиваем дубликаты.
+        """
         field_map = self._list_custom_fields_map(list_id)
-        for t in out:
-            t["status"] = (t.get("status") or {}).get("status", "")
-            # кастомные — в “fields”
-            cf = {}
-            for fld in (t.get("custom_fields") or []):
-                name = fld.get("name")
-                val = fld.get("value")
-                if name:
-                    cf[name] = val
-            t["fields"] = cf
 
-        return out
+        custom_fields: List[Dict[str, Any]] = []
 
+        # мы не знаем ТВОИ точные названия полей, поэтому просто
+        # пытаемся сопоставить по самым распространённым.
+        def _maybe_add(field_title: str, value: Any) -> None:
+            if not value:
+                return
+            fid = field_map.get(field_title)
+            if not fid:
+                return
+            custom_fields.append({"id": fid, "value": value})
+
+        _maybe_add("Номер телефона", lead.get("phone"))
+        _maybe_add("Общий адрес электронной почты", lead.get("email"))
+        _maybe_add("URL веб-сайта", lead.get("website"))
+        _maybe_add("Принадлежность к сети", lead.get("network"))
+        _maybe_add("Выявленные возможности", lead.get("notes"))
+
+        payload: Dict[str, Any] = {
+            "name": lead["name"],
+            # ВАЖНО: создаём ВСЕГДА в NEW, как ты попросил
+            "status": "NEW",
+        }
+        if custom_fields:
+            payload["custom_fields"] = custom_fields
+
+        url = f"{CLICKUP_API_BASE}/list/{list_id}/task"
+        r = requests.post(url, json=payload, headers=self._headers(), timeout=25)
+        self._raise_for(r, "ClickUp create lead task")
+        data = r.json()
+        return str(data["id"])
+
+    # ------------- поиск и изменение статуса -------------
     def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
         """
-        Поиск задачи по email в КАСТОМНОМ поле “Общий адрес электронной почты” (как в твоём листе).
-        Если назовёшь поле по-другому — поправим тут.
+        Ищем по всем листам space'а — задачу, у которой есть кастомное поле с таким email.
+        Это нужно для /replies.
         """
-        # проходим по всем листам? сейчас — нет, только по space/list’ам которые мы сами создаём.
-        # для простоты — бежим по space и ищем в листах, которые начинаются на LEADS-
-        url = f"{BASE_URL}/space/{self.space_id}/list"
-        data = self._get(url)
-        for item in data.get("lists", []):
-            list_id = str(item["id"])
+        # сначала пройдёмся по листам
+        lists_url = f"{CLICKUP_API_BASE}/space/{self.space_id}/list"
+        r = requests.get(lists_url, headers=self._headers(), timeout=20)
+        if not r.ok:
+            log.warning("ClickUp: can't list lists for find_task_by_email: %s %s", r.status_code, r.text[:200])
+            return None
+        for lst in r.json().get("lists", []):
+            list_id = str(lst["id"])
             tasks = self.get_leads_from_list(list_id)
             for t in tasks:
-                fields = t.get("fields") or {}
-                if not fields:
-                    continue
-                mail = fields.get("Общий адрес электронной почты") or fields.get("Email") or ""
-                if mail and mail.lower() == email_addr.lower():
+                if t.get("email") and t["email"].lower() == email_addr.lower():
+                    # вернём всё, что знаем
                     return {
-                        "task_id": t["id"],
-                        "clinic_name": t.get("name") or t.get("text") or "",
+                        "task_id": t["task_id"],
+                        "clinic_name": t.get("name") or "",
                     }
         return None
 
     def move_lead_to_status(self, task_id: str, status: str) -> None:
-        url = f"{BASE_URL}/task/{task_id}"
-        self._put(url, {"status": status})
-
-    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> None:
-        """
-        Создаём или обновляем лид по какому-то ключу.
-        Пока что делаем просто: создаём новую задачу.
-        Ключ можно будет сделать по “place_id” или по “название+телефон”.
-        """
-        name = lead.get("name") or "Clinic"
-        status = lead.get("status") or READY_STATUS
-
-        payload: Dict[str, Any] = {
-            "name": name,
-            "status": status,
-        }
-
-        # сначала создаём таску
-        created = self._post(f"{BASE_URL}/list/{list_id}/task", payload)
-        task_id = created["id"]
-
-        # теперь расставим кастомные поля, если они есть
-        field_map = self._list_custom_fields_map(list_id)
-
-        def _set_cf(field_name: str, value: Any) -> None:
-            fid = field_map.get(field_name)
-            if not fid:
-                return
-            self._put(
-                f"{BASE_URL}/task/{task_id}/field/{fid}",
-                {"value": value},
-            )
-
-        # маппинг наших полей -> в твой лист
-        if lead.get("email"):
-            _set_cf("Общий адрес электронной почты", lead["email"])
-        if lead.get("phone"):
-            _set_cf("Номер телефона", lead["phone"])
-        if lead.get("website"):
-            _set_cf("URL веб-сайта", lead["website"])
-        if lead.get("facebook"):
-            _set_cf("URL Facebook", lead["facebook"])
-        if lead.get("instagram"):
-            _set_cf("URL Instagram", lead["instagram"])
-        if lead.get("linkedin"):
-            _set_cf("URL LinkedIn", lead["linkedin"])
-        if lead.get("twitter"):
-            _set_cf("URL Twitter/X", lead["twitter"])
-
-        # можно положить исходник
-        if lead.get("source"):
-            _set_cf("Принадлежность к соцсети / источнику", lead["source"])
-
-        # и адрес
-        if lead.get("address"):
-            _set_cf("Общий адрес", lead["address"])
+        url = f"{CLICKUP_API_BASE}/task/{task_id}"
+        r = requests.put(url, json={"status": status}, headers=self._headers(), timeout=20)
+        self._raise_for(r, f"ClickUp move task {task_id} to {status}")
 
 
-# singleton
-clickup_client = ClickUpClient(space_id=SPACE_ID, team_id=TEAM_ID)
+# инициализация клиента, как раньше
+clickup_client = ClickUpClient(
+    token=os.environ.get("CLICKUP_API_TOKEN", ""),
+    team_id=os.environ.get("CLICKUP_TEAM_ID", ""),
+    space_id=os.environ.get("CLICKUP_SPACE_ID", ""),
+    template_list_id=os.environ.get("CLICKUP_TEMPLATE_LIST_ID", ""),  # может быть пусто
+)
