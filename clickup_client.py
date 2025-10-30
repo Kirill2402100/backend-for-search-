@@ -253,7 +253,9 @@ class ClickUpClient:
     # ---------------- higher level ----------------
 
     def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> bool:
-        clinic_name = (lead.get("clinic_name") or "").strip()
+        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢 =====
+        # Было: lead.get("clinic_name")
+        clinic_name = (lead.get("name") or "").strip()
         if not clinic_name:
             return False
 
