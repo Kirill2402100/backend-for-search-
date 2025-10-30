@@ -1,34 +1,39 @@
 # leads.py
+import os
 import logging
-from typing import List, Dict, Any, Set
+from typing import Dict, Any, List
 
 import requests
 
-from config import settings
 from clickup_client import clickup_client
 
 log = logging.getLogger("leads")
 
-# базовые запросы для любого штата
-BASE_QUERIES = [
-    "dentist {state}",
-    "dental clinic {state}",
-    "cosmetic dentist {state}",
-    "orthodontist {state}",
-]
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
+EMAIL_VALIDATION_API_KEY = os.getenv("EMAIL_VALIDATION_API_KEY", "")
+EMAIL_VALIDATION_PROVIDER = os.getenv("EMAIL_VALIDATION_PROVIDER", "")
 
-# дополнительные города/регионы по штатам
-STATE_CITY_QUERIES: Dict[str, List[str]] = {
-    # Нью-Йорк — тут и правда есть боро
+# мы специально НЕ даём лимит страниц — берём столько, сколько собрали из запросов
+GOOGLE_PLACES_BASE = "https://places.googleapis.com/v1/places:searchText"
+
+# базовый набор запросов по штату
+STATE_QUERIES = {
+    # штат: список поисков
+    # для FL я специально добавил больше городов
     "NY": [
+        "dentist NY",
+        "dental clinic NY",
         "dentist Manhattan NY",
         "dentist Brooklyn NY",
         "dentist Queens NY",
         "dentist Bronx NY",
         "dentist Staten Island NY",
     ],
-    # Флорида — добавим крупные города
     "FL": [
+        "dentist FL",
+        "dental clinic FL",
+        "cosmetic dentist FL",
+        "orthodontist FL",
         "dentist Miami FL",
         "dentist Orlando FL",
         "dentist Tampa FL",
@@ -36,144 +41,92 @@ STATE_CITY_QUERIES: Dict[str, List[str]] = {
         "dentist Fort Lauderdale FL",
         "dentist West Palm Beach FL",
     ],
-    # Калифорния — на будущее
-    "CA": [
-        "dentist Los Angeles CA",
-        "dentist San Francisco CA",
-        "dentist San Diego CA",
-        "dentist Sacramento CA",
-    ],
 }
 
-# что хотим хранить (пока будем заполнять только website)
-SOCIAL_FIELDS = ["facebook", "instagram", "linkedin"]
 
+def _google_search_one(query: str) -> List[Dict[str, Any]]:
+    if not GOOGLE_PLACES_API_KEY:
+        log.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
+        return []
 
-def _places_search_text(api_key: str, text_query: str):
-    url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
         "X-Goog-FieldMask": (
-            "places.id,"
-            "places.displayName.text,"
-            "places.formattedAddress,"
-            "places.websiteUri,"
-            "places.googleMapsUri"
+            "places.displayName,places.formattedAddress,places.websiteUri,"
+            "places.internationalPhoneNumber,places.googleMapsUri,"
+            "places.primaryType,places.id"
         ),
     }
-    body = {
-        "textQuery": text_query,
-        "pageSize": 20,
-    }
-    resp = requests.post(url, headers=headers, json=body, timeout=15)
-    if resp.status_code != 200:
-        log.warning("google textsearch status=%s data=%s", resp.status_code, resp.text)
-        return [], None
-    data = resp.json()
-    return data.get("places", []), data.get("nextPageToken")
+    payload = {"textQuery": query}
+    r = requests.post(GOOGLE_PLACES_BASE, headers=headers, json=payload, timeout=15)
+    if r.status_code >= 400:
+        log.warning("google textsearch %s -> %s %s", query, r.status_code, r.text[:200])
+        return []
+    data = r.json()
+    places = data.get("places") or []
+    log.info("leads:google (new) '%s' -> %d places", query, len(places))
+    return places
 
 
-def _collect_all_pages(api_key: str, query: str) -> List[Dict[str, Any]]:
+def _places_for_state(state: str) -> List[Dict[str, Any]]:
+    qs = STATE_QUERIES.get(state.upper())
+    if not qs:
+        # дефолт — просто штат
+        qs = [f"dentist {state}"]
     all_places: List[Dict[str, Any]] = []
-
-    places, next_token = _places_search_text(api_key, query)
-    all_places.extend(places)
-
-    # крутимся пока дают токен
-    while next_token:
-        url = "https://places.googleapis.com/v1/places:searchText"
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": api_key,
-            "X-Goog-FieldMask": (
-                "places.id,"
-                "places.displayName.text,"
-                "places.formattedAddress,"
-                "places.websiteUri,"
-                "places.googleMapsUri"
-            ),
-        }
-        body = {
-            "textQuery": query,
-            "pageSize": 20,
-            "pageToken": next_token,
-        }
-        resp = requests.post(url, headers=headers, json=body, timeout=15)
-        if resp.status_code != 200:
-            log.warning(
-                "google textsearch page status=%s data=%s", resp.status_code, resp.text
-            )
-            break
-        data = resp.json()
-        places = data.get("places", [])
-        all_places.extend(places)
-        next_token = data.get("nextPageToken")
-
-    return all_places
-
-
-def _normalize_place(p: Dict[str, Any]) -> Dict[str, Any]:
-    name = (p.get("displayName") or {}).get("text") or ""
-    website = p.get("websiteUri") or ""
-    address = p.get("formattedAddress") or ""
-    gmaps = p.get("googleMapsUri") or ""
-
-    out = {
-        "place_id": p.get("id") or "",
-        "name": name,
-        "website": website,
-        "address": address,
-        "google_maps": gmaps,
-    }
-    # заготовим соцсети, но пока пустые — из Places их нет
-    for sf in SOCIAL_FIELDS:
-        out[sf] = ""
+    for q in qs:
+        all_places.extend(_google_search_one(q))
+    # дедуп по place_id / displayName+address
+    uniq: Dict[str, Dict[str, Any]] = {}
+    for p in all_places:
+        pid = p.get("id") or p.get("name") or p.get("googleMapsUri") or p.get("displayName", {}).get("text")
+        if not pid:
+            continue
+        uniq[pid] = p
+    out = list(uniq.values())
+    log.info("leads:after dedupe -> %d places for %s", len(out), state)
     return out
 
 
+def _lead_from_place(p: Dict[str, Any]) -> Dict[str, Any]:
+    name = (p.get("displayName") or {}).get("text") or "No name"
+    website = p.get("websiteUri") or ""
+    phone = p.get("internationalPhoneNumber") or ""
+    # соцсети редко есть в Places, оставляем пустыми
+    return {
+        "name": name,
+        "website": website,
+        "email": "",      # будешь дальше обогащать
+        "facebook": "",
+        "instagram": "",
+        "linkedin": "",
+        "phone": phone,
+    }
+
+
 def upsert_leads_for_state(state: str) -> Dict[str, int]:
-    state = state.upper()
-
-    api_key = getattr(settings, "GOOGLE_PLACES_API_KEY", "")
-    if not api_key:
-        log.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
-        return {"found": 0, "created": 0, "skipped": 0}
-
-    # получаем список
     list_id = clickup_client.get_or_create_list_for_state(state)
-    log.info("start collecting for %s -> list %s", state, list_id)
+    places = _places_for_state(state)
 
-    # какие запросы будем делать именно для этого штата
-    queries: List[str] = [q.format(state=state) for q in BASE_QUERIES]
-    extra = STATE_CITY_QUERIES.get(state, [])
-    if extra:
-        queries.extend(extra)
-
-    seen: Set[str] = set()
-    leads: List[Dict[str, Any]] = []
-
-    for q in queries:
-        places = _collect_all_pages(api_key, q)
-        log.info("google (new) '%s' -> %d places", q, len(places))
-        for p in places:
-            pid = p.get("id")
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            leads.append(_normalize_place(p))
-
-    log.info("leads:after dedupe -> %d places for %s", len(leads), state)
-
-    found = len(leads)
+    found = len(places)
     created = 0
     skipped = 0
 
-    for lead in leads:
-        ok = clickup_client.upsert_lead(list_id, lead)
-        if ok:
-            created += 1
-        else:
+    for p in places:
+        lead = _lead_from_place(p)
+        try:
+            ok = clickup_client.upsert_lead(list_id, lead)
+            if ok:
+                created += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            # важно не падать из-за одной плохой задачи
             skipped += 1
+            log.warning("cannot upsert lead %s: %s", lead.get("name"), e)
 
-    return {"found": found, "created": created, "skipped": skipped}
+    return {
+        "found": found,
+        "created": created,
+        "skipped": skipped,
+    }
