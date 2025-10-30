@@ -1,209 +1,217 @@
 # leads.py
-"""
-Собираем лидов по штату из Google Places и добавляем в ClickUp.
-Нужны переменные окружения:
-  - GOOGLE_PLACES_API_KEY
-Опционально:
-  - MAX_LEADS_PER_STATE (по умолчанию 80)
-"""
-
-from __future__ import annotations
-import os
+import logging
+import re
 import time
+from typing import Any, Dict, List, Optional
+
 import requests
-from typing import Dict, List, Iterable, Tuple
 
-from clickup_client import clickup_client, READY_STATUS, NEW_STATUS  # NEW_STATUS есть в client
 from config import settings
+from clickup_client import (
+    clickup_client,
+    READY_STATUS,
+    NEW_STATUS,
+)
 
-GOOGLE_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
-MAX_LEADS = int(os.getenv("MAX_LEADS_PER_STATE", "80"))
-
-# маппинг штатов: аббревиатура -> полное имя (для запросов)
-US_STATE_NAMES: Dict[str, str] = {
-    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado","CT":"Connecticut",
-    "DE":"Delaware","FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
-    "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland","MA":"Massachusetts","MI":"Michigan",
-    "MN":"Minnesota","MS":"Mississippi","MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
-    "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
-    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
-    "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington","WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming"
-}
-
-# несколько крупных городов для ряда штатов (для лучшей выборки);
-# если штата нет в списке — упадём на общий поиск "Dentist in <StateName>"
-TOP_CITIES: Dict[str, List[str]] = {
-    "NY": ["New York", "Brooklyn", "Queens", "Bronx", "Staten Island", "Buffalo", "Rochester", "Yonkers", "Syracuse", "Albany"],
-    "CA": ["Los Angeles", "San Diego", "San Jose", "San Francisco", "Fresno", "Sacramento", "Long Beach", "Oakland", "Bakersfield"],
-    "FL": ["Miami", "Orlando", "Tampa", "Jacksonville", "St. Petersburg", "Hialeah"],
-    "TX": ["Houston", "Dallas", "San Antonio", "Austin", "Fort Worth", "El Paso"],
-}
-
-PLACES_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-PLACES_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+logger = logging.getLogger("leads")
 
 
-def _g_places_text_search(query: str, key: str, pages: int = 3) -> Iterable[Dict]:
-    """Итератор результатов Text Search (с пейджингом)."""
-    next_page = None
-    for _ in range(pages):
-        params = {"query": query, "type": "dentist", "key": key}
-        if next_page:
-            params["pagetoken"] = next_page
-            # per Google требуются ~2 сек перед использованием next_page_token
-            time.sleep(2.0)
-        r = requests.get(PLACES_SEARCH_URL, params=params, timeout=30)
-        data = r.json()
-        for item in data.get("results", []):
-            yield item
-        next_page = data.get("next_page_token")
-        if not next_page:
-            break
+GOOGLE_PLACES_API_KEY = getattr(settings, "GOOGLE_PLACES_API_KEY", "").strip()
+
+# простейшая нормализация телефона, чтобы можно было сравнивать
+_phone_clean_re = re.compile(r"\D+")
 
 
-def _g_place_details(place_id: str, key: str) -> Dict:
-    params = {
-        "place_id": place_id,
-        "fields": "name,formatted_address,formatted_phone_number,website,place_id",
-        "key": key,
-    }
-    r = requests.get(PLACES_DETAILS_URL, params=params, timeout=30)
-    return r.json().get("result", {}) or {}
+def _clean_phone(p: Optional[str]) -> str:
+    if not p:
+        return ""
+    return _phone_clean_re.sub("", p)
 
 
-def _dedup(leads: Iterable[Dict]) -> List[Dict]:
-    """Дедуп по website -> phone -> name+address."""
-    out: List[Dict] = []
-    seen_web: set = set()
-    seen_phone: set = set()
-    seen_sig: set = set()
-    for l in leads:
-        web = (l.get("website") or "").strip().lower()
-        ph = (l.get("phone") or "").strip()
-        sig = (l.get("name","").strip().lower(), l.get("address","").strip().lower())
-        if web and web in seen_web:
-            continue
-        if (not web) and ph and ph in seen_phone:
-            continue
-        if (not web) and (not ph) and sig in seen_sig:
-            continue
-        if web: seen_web.add(web)
-        elif ph: seen_phone.add(ph)
-        else: seen_sig.add(sig)
-        out.append(l)
-    return out
-
-
-def collect_from_google(state_code: str) -> List[Dict]:
-    """Собираем из Google Places. Возвращаем список словарей лидов."""
-    if not GOOGLE_KEY:
+def _google_places_text_search(state: str) -> List[Dict[str, Any]]:
+    """
+    Идём в Google Places Text Search и достаём все «dentist in {state}, USA».
+    Возвращаем список place_id + базовые данные.
+    """
+    if not GOOGLE_PLACES_API_KEY:
+        logger.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
         return []
 
-    state_name = US_STATE_NAMES.get(state_code.upper(), state_code.upper())
-    queries: List[str] = []
-    cities = TOP_CITIES.get(state_code.upper())
-    if cities:
-        for c in cities:
-            queries.append(f"Dentist in {c}, {state_code}")
-    else:
-        queries.append(f"Dentist in {state_name}")
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {
+        "query": f"dentist in {state}, USA",
+        "key": GOOGLE_PLACES_API_KEY,
+    }
 
-    leads: List[Dict] = []
-    for q in queries:
-        # до 3 страниц по каждому запросу (примерно до ~60 мест)
-        for item in _g_places_text_search(q, GOOGLE_KEY, pages=3):
-            pid = item.get("place_id")
-            if not pid:
-                continue
-            details = _g_place_details(pid, GOOGLE_KEY)
-            name = details.get("name") or item.get("name")
-            if not name:
-                continue
-            leads.append({
-                "name": name,
-                "address": details.get("formatted_address") or item.get("formatted_address"),
-                "phone": details.get("formatted_phone_number"),
-                "website": details.get("website"),
-                "source": f"GooglePlaces:{pid}",
-            })
-            if len(leads) >= MAX_LEADS:
-                break
-        if len(leads) >= MAX_LEADS:
+    results: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        status = data.get("status")
+        if status not in ("OK", "ZERO_RESULTS"):
+            logger.warning("google textsearch status=%s data=%s", status, data)
             break
 
-    return _dedup(leads)
+        items = data.get("results", [])
+        results.extend(items)
+
+        next_token = data.get("next_page_token")
+        if not next_token:
+            break
+
+        # у Places есть задержка между страницами
+        time.sleep(2)
+        params["pagetoken"] = next_token
+        page += 1
+        # ограничимся 3 страницами, чтобы не ушатать лимит
+        if page > 3:
+            break
+
+    return results
 
 
-def _existing_keys_for_list(list_id: str) -> Tuple[set, set, set]:
-    """Собираем ключи существующих лидов, чтобы не плодить дубликаты."""
-    tasks = clickup_client.get_leads_from_list(list_id)
-    by_web, by_phone, by_sig = set(), set(), set()
-    for t in tasks:
-        web = (t.get("website") or "").strip().lower()
-        ph = (t.get("phone") or "").strip()
-        sig = (t.get("clinic_name","").strip().lower(), t.get("address","").strip().lower())
-        if web: by_web.add(web)
-        if ph: by_phone.add(ph)
-        by_sig.add(sig)
-    return by_web, by_phone, by_sig
-
-
-def _create_task_in_clickup(list_id: str, lead: Dict) -> None:
+def _google_place_details(place_id: str) -> Dict[str, Any]:
     """
-    Создаём задачу. Используем клиентские заголовки/базовый URL из clickup_client.
-    Пишем в описание телефоны/сайт/источник.
+    Берём подробности по place_id, чтобы достать сайт и телефон.
     """
-    desc_lines = []
-    if lead.get("website"): desc_lines.append(f"Website: {lead['website']}")
-    if lead.get("phone"): desc_lines.append(f"Phone: {lead['phone']}")
-    if lead.get("address"): desc_lines.append(f"Address: {lead['address']}")
-    if lead.get("source"): desc_lines.append(f"Source: {lead['source']}")
-    description = "\n".join(desc_lines) or "—"
+    if not GOOGLE_PLACES_API_KEY:
+        return {}
 
-    payload = {
-        "name": lead["name"],
-        "description": description,
-        "status": NEW_STATUS,  # кладём в NEW, ты сам потом помечаешь READY
+    url = "https://maps.googleapis.com/maps/api/place/details/json"
+    params = {
+        "place_id": place_id,
+        "key": GOOGLE_PLACES_API_KEY,
+        # нам нужен хотя бы телефон и сайт
+        "fields": "name,formatted_phone_number,website",
     }
-    url = f"{clickup_client.BASE_URL}/list/{list_id}/task"
-    r = requests.post(url, headers=clickup_client.headers, json=payload, timeout=30)
-    r.raise_for_status()
+    resp = requests.get(url, params=params, timeout=15)
+    data = resp.json()
+    if data.get("status") != "OK":
+        return {}
+    return data.get("result") or {}
 
 
-def upsert_leads_for_state(state_code: str) -> Dict[str, int]:
+def _existing_keys_for_list(list_id: str):
     """
-    Главная функция: создаёт/находит лист, собирает лидов и добавляет новые.
-    Возвращает отчёт по количествам.
+    Загружаем уже существующие лиды и строим 3 множества:
+    - по названию
+    - по телефону
+    - по сайту
+    чтобы не создавать дубли
     """
-    list_id = clickup_client.get_or_create_list_for_state(state_code)
-    # статусы уже обеспечиваются клиентом, оставляем как есть
+    tasks = clickup_client.get_leads_from_list(list_id)
 
-    # собираем
-    g_leads = collect_from_google(state_code)
+    by_name = set()
+    by_phone = set()
+    by_site = set()
 
-    # дедуп по существующим
-    by_web, by_phone, by_sig = _existing_keys_for_list(list_id)
-    created, skipped = 0, 0
-    for lead in g_leads:
-        web = (lead.get("website") or "").strip().lower()
-        ph = (lead.get("phone") or "").strip()
-        sig = (lead.get("name","").strip().lower(), (lead.get("address") or "").strip().lower())
-        if (web and web in by_web) or (not web and ph and ph in by_phone) or (not web and not ph and sig in by_sig):
+    for t in tasks:
+        name = (t.get("clinic_name") or "").strip().lower()
+        if name:
+            by_name.add(name)
+
+        phone = _clean_phone(t.get("phone"))
+        if phone:
+            by_phone.add(phone)
+
+        site = (t.get("website") or "").strip().lower()
+        if site:
+            by_site.add(site)
+
+    return by_name, by_phone, by_site, tasks
+
+
+def upsert_leads_for_state(state: str) -> Dict[str, Any]:
+    """
+    Главная функция: вызывается из telegram_bot.
+    1. гарантируем лист
+    2. тянем из гугла
+    3. создаём новых
+    4. отдаём краткий отчёт
+    """
+    state = state.upper()
+    list_id = clickup_client.get_or_create_list_for_state(state)
+
+    found = 0
+    created = 0
+    skipped = 0
+
+    # что уже есть в листе
+    by_name, by_phone, by_site, existing_tasks = _existing_keys_for_list(list_id)
+
+    # 1. гугл
+    google_places = _google_places_text_search(state)
+    logger.info("google returned %d places for %s", len(google_places), state)
+
+    for place in google_places:
+        found += 1
+        name = (place.get("name") or "").strip()
+        if not name:
             skipped += 1
             continue
-        try:
-            _create_task_in_clickup(list_id, lead)
-            created += 1
-            if web: by_web.add(web)
-            elif ph: by_phone.add(ph)
-            else: by_sig.add(sig)
-        except Exception:
-            # проглатываем единичные ошибки, чтобы не падать всю загрузку
+
+        # если такое имя уже есть — дубликат
+        if name.lower() in by_name:
             skipped += 1
+            continue
+
+        place_id = place.get("place_id")
+        details = _google_place_details(place_id) if place_id else {}
+
+        website = (details.get("website") or "").strip()
+        phone = _clean_phone(details.get("formatted_phone_number"))
+
+        # проверим по сайту
+        if website and website.lower() in by_site:
+            skipped += 1
+            continue
+
+        # проверим по телефону
+        if phone and phone in by_phone:
+            skipped += 1
+            continue
+
+        # создаём задачу
+        status = READY_STATUS if website else NEW_STATUS
+        clickup_client.create_lead_task(
+            list_id=list_id,
+            clinic_name=name,
+            website=website,
+            email_=None,  # email ты сам будешь вписывать
+            phone=phone,
+            signature=None,
+            status=status,
+        )
+
+        created += 1
+        by_name.add(name.lower())
+        if website:
+            by_site.add(website.lower())
+        if phone:
+            by_phone.add(phone)
+
+    # можно здесь же будет довесить Yelp/Zocdoc/Healthgrades
+
+    # после апдейта — перечитаем лист для статистики
+    final_tasks = clickup_client.get_leads_from_list(list_id)
+    total = len(final_tasks)
+    with_email = sum(1 for t in final_tasks if t.get("email"))
+    no_email = total - with_email
+    ready = sum(1 for t in final_tasks if t.get("status") == READY_STATUS)
+    sent = sum(1 for t in final_tasks if t.get("status") == "SENT")
+    remaining = sum(1 for t in final_tasks if (t.get("email") and t.get("status") != "SENT"))
 
     return {
-        "collected": len(g_leads),
+        "state": state,
+        "list_id": list_id,
+        "found": found,
         "created": created,
         "skipped": skipped,
-        "list_id": list_id,
+        "total_in_list": total,
+        "with_email": with_email,
+        "no_email": no_email,
+        "ready": ready,
+        "sent": sent,
+        "remaining_unsent": remaining,
     }
