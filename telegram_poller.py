@@ -6,23 +6,23 @@ from typing import Dict, Any
 import requests
 
 from config import settings
-from telegram_bot import handle_update, TELEGRAM_API_BASE  # возьмём базовый URL из бота
 
 logger = logging.getLogger("app.poller")
+
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
 def start_polling() -> None:
     """
-    Простой long-polling.
-    Запускается из main.py в отдельном потоке.
-    Никаких проверок TELEGRAM_POLLING тут нет — всегда работаем.
+    Простой бесконечный long-polling.
+    НИЧЕГО не проверяем по env — всегда работаем.
     """
     token = getattr(settings, "TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         logger.warning("Polling not started: TELEGRAM_BOT_TOKEN is empty")
         return
 
-    # на всякий случай — уберём webhook, чтобы getUpdates работал
+    # на всякий случай уберём webhook
     try:
         r = requests.get(f"{TELEGRAM_API_BASE}/bot{token}/deleteWebhook", timeout=10)
         logger.info("[poller] deleteWebhook: %s %s", r.status_code, r.text[:200])
@@ -30,7 +30,7 @@ def start_polling() -> None:
         logger.warning("[poller] deleteWebhook error: %s", e)
 
     offset = 0
-    logger.info("Polling started (forced)")
+    logger.info("Polling started")
 
     while True:
         try:
@@ -53,11 +53,10 @@ def start_polling() -> None:
             time.sleep(2)
             continue
 
-        data: Dict[str, Any] = resp.json()
-        updates = data.get("result", [])
-
+        payload: Dict[str, Any] = resp.json()
+        updates = payload.get("result", [])
         if not updates:
-            # нет апдейтов — ждём следующий
+            # тихо ждём следующее
             continue
 
         for upd in updates:
@@ -69,10 +68,13 @@ def start_polling() -> None:
             ).get("chat", {}).get("id")
             logger.info("[poller] update %s from chat %s", upd_id, chat_id)
 
+            # импорт тут, чтобы не ловить циклический импорт наверху
+            from telegram_bot import handle_update  # noqa
+
             try:
                 handle_update(upd)
             except Exception as e:
                 logger.exception("[poller] handle_update error: %s", e)
 
-        # маленькая пауза, чтобы не долбить Telegram
+        # чуть-чуть подождём
         time.sleep(0.3)
