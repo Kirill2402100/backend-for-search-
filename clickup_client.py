@@ -12,17 +12,17 @@ CLICKUP_BASE = "https://api.clickup.com/api/v2"
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN", "")
 CLICKUP_SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "")
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
-# важное: это id ЛИСТА-ШАБЛОНА (у тебя сейчас это NY)
+# он у нас есть в env, но мы его БОЛЬШЕ НЕ ИСПОЛЬЗУЕМ специально
 CLICKUP_TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "")
 
-# ===== статусы =====
+# ===== наши статусы =====
 NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
-REPLIED_STATUS = "REPLIED"      # ← для совместимости с telegram_bot.py
+REPLIED_STATUS = "REPLIED"
 INVALID_STATUS = "INVALID"
 
-# какие кастомные поля нам нужны
+# ===== нужные кастомные поля (если получится) =====
 REQUIRED_CUSTOM_FIELDS = {
     "Email": {"type": "text"},
     "Website": {"type": "text"},
@@ -43,7 +43,7 @@ class ClickUpClient:
         self.session = requests.Session()
         self.session.headers.update({"Authorization": CLICKUP_API_TOKEN})
 
-    # ---------- low level ----------
+    # ---------------- low level ----------------
 
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         r = self.session.get(url, params=params, timeout=25)
@@ -63,16 +63,16 @@ class ClickUpClient:
             raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
         return r.json()
 
-    # ---------- lists ----------
+    # ---------------- lists ----------------
 
     def _list_lists_in_space(self) -> List[Dict[str, Any]]:
         url = f"{CLICKUP_BASE}/space/{CLICKUP_SPACE_ID}/list"
         data = self._get(url)
         return data.get("lists", [])
 
-    def _set_pipeline_like_ny(self, list_id: str) -> None:
+    def _set_pipeline(self, list_id: str) -> None:
         """
-        Ставим свой набор статусов через правильный эндпоинт: PUT /list/{id}
+        Ставим наш набор статусов через корректный эндпоинт.
         """
         url = f"{CLICKUP_BASE}/list/{list_id}"
         payload = {
@@ -88,6 +88,7 @@ class ClickUpClient:
             self._put(url, payload)
             log.info("clickup:set pipeline for list %s", list_id)
         except ClickUpError as e:
+            # если в спейсе запрещено менять статусы — будет просто варнинг
             log.warning("clickup:cannot set pipeline on list %s: %s", list_id, e)
 
     def _list_custom_fields(self, list_id: str) -> Dict[str, str]:
@@ -103,18 +104,20 @@ class ClickUpClient:
 
     def _create_field_on_list(self, list_id: str, name: str, ftype: str) -> Optional[str]:
         """
-        Создаём кастомное поле. Если API вернул 200 без id — перечитываем и берём по имени.
+        Пробуем создать кастомное поле. Если план не даёт — вернём None.
         """
         url = f"{CLICKUP_BASE}/list/{list_id}/field"
         payload = {"type": ftype, "name": name, "required": False}
         try:
             resp = self._post(url, payload)
         except ClickUpError as e:
+            # это как раз твой случай: FIELD_033 → план не даёт
             log.warning("clickup:cannot create field %s on list %s (%s)", name, list_id, e)
             return None
 
         fid = resp.get("id")
         if not fid:
+            # бывает 200 без id — перечитаем
             fields_after = self._list_custom_fields(list_id)
             fid = fields_after.get(name)
             if not fid:
@@ -123,54 +126,56 @@ class ClickUpClient:
         return fid
 
     def _ensure_required_fields(self, list_id: str) -> Dict[str, Optional[str]]:
-        existing = self._list_custom_fields(list_id)
+        """
+        Создаём нужные поля, НО если план не даёт — вернём словарь с None.
+        """
+        try:
+            existing = self._list_custom_fields(list_id)
+        except ClickUpError as e:
+            log.warning("clickup:cannot list fields on %s: %s", list_id, e)
+            return {name: None for name in REQUIRED_CUSTOM_FIELDS.keys()}
+
         result: Dict[str, Optional[str]] = {}
+
         for fname, cfg in REQUIRED_CUSTOM_FIELDS.items():
             if fname in existing:
                 result[fname] = existing[fname]
             else:
-                result[fname] = self._create_field_on_list(list_id, fname, cfg["type"])
+                fid = self._create_field_on_list(list_id, fname, cfg["type"])
+                result[fname] = fid
         return result
 
     def get_or_create_list_for_state(self, state: str) -> str:
+        """
+        ВАЖНО: больше НЕ создаём из шаблона.
+        Потому что шаблон тащит русские статусы, и ClickUp не даёт их перезаписать.
+        """
         state = state.upper()
         target_name = f"LEADS-{state}"
 
-        # 1) ищем уже существующий
+        # 1. ищем уже существующий
         for lst in self._list_lists_in_space():
             if lst.get("name") == target_name:
                 return lst["id"]
 
-        # 2) создаём из шаблона (NY)
-        if CLICKUP_TEMPLATE_LIST_ID:
-            url = f"{CLICKUP_BASE}/space/{CLICKUP_SPACE_ID}/list"
-            payload = {"name": target_name, "content": "", "template_id": CLICKUP_TEMPLATE_LIST_ID}
-            resp = self._post(url, payload)
-            new_id = resp["id"]
-            log.info("clickup:created list %s from template %s (%s)", new_id, CLICKUP_TEMPLATE_LIST_ID, target_name)
-
-            # ВАЖНО: даже после шаблона — накатываем свои статусы
-            self._set_pipeline_like_ny(new_id)
-            self._ensure_required_fields(new_id)
-            return new_id
-
-        # 3) без шаблона — пустой и свои статусы
+        # 2. создаём пустой лист в спейсе
         url = f"{CLICKUP_BASE}/space/{CLICKUP_SPACE_ID}/list"
         payload = {"name": target_name, "content": ""}
         resp = self._post(url, payload)
         new_id = resp["id"]
         log.info("clickup:created list %s (%s)", new_id, target_name)
 
-        self._set_pipeline_like_ny(new_id)
+        # 3. ставим наш pipeline
+        self._set_pipeline(new_id)
+
+        # 4. пробуем создать поля, но если не получилось — работаем дальше без них
         self._ensure_required_fields(new_id)
+
         return new_id
 
-    # ---------- tasks ----------
+    # ---------------- tasks ----------------
 
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        """
-        Возвращает задачи (лиды) из листа.
-        """
         url = f"{CLICKUP_BASE}/list/{list_id}/task"
         data = self._get(url, params={"subtasks": "true"})
         return data.get("tasks", [])
@@ -184,28 +189,31 @@ class ClickUpClient:
         custom_fields: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
-        Если при создании задачи получаем "Status not found" (CRTSK_001),
-        повторяем без поля status (лист подставит дефолтный).
+        1) пробуем создать с нашим статусом и полями
+        2) если "Status not found" → сразу без статуса и без полей
+        3) если "FIELD_033" → без полей (и без статуса, чтобы ещё раз не поймать гонку)
         """
         url = f"{CLICKUP_BASE}/list/{list_id}/task"
-        base_payload: Dict[str, Any] = {"name": name}
-        if description:
-            base_payload["description"] = description
 
-        cf_list: List[Dict[str, Any]] = []
+        def _base_payload() -> Dict[str, Any]:
+            p: Dict[str, Any] = {"name": name}
+            if description:
+                p["description"] = description
+            return p
+
+        # --- 1. первая попытка: как хотим ---
+        payload = _base_payload()
+        payload["status"] = status
         if custom_fields:
+            cf_list: List[Dict[str, Any]] = []
             for fid, val in custom_fields.items():
                 if fid:
                     cf_list.append({"id": fid, "value": val})
-        if cf_list:
-            base_payload["custom_fields"] = cf_list
-
-        # 1) пробуем со статусом
-        payload_with_status = dict(base_payload)
-        payload_with_status["status"] = status
+            if cf_list:
+                payload["custom_fields"] = cf_list
 
         try:
-            resp = self._post(url, payload_with_status)
+            resp = self._post(url, payload)
             task_id = resp.get("id")
             if task_id:
                 log.info("clickup:created lead task %s on list %s (%s)", task_id, list_id, name)
@@ -213,28 +221,36 @@ class ClickUpClient:
         except ClickUpError as e:
             txt = str(e)
 
-            # Статус ещё "не подхватился" листом — retry без статуса
+            # --- 2. статус ещё не применился на листе ---
             if "Status not found" in txt or "CRTSK_001" in txt:
-                log.warning("clickup:create task on list %s failed (status not found) -> retry without status", list_id)
-                resp = self._post(url, base_payload)
+                log.warning(
+                    "clickup:create task on list %s failed (status not found) -> retrying without status & fields",
+                    list_id,
+                )
+                payload2 = _base_payload()
+                # без статуса и БЕЗ кастомных полей
+                resp = self._post(url, payload2)
                 return resp.get("id")
 
-            # Перелимит кастомных полей — пробуем без них
+            # --- 3. лимит по кастомным полям ---
             if "FIELD_033" in txt:
-                log.warning("clickup:custom field limit on list %s -> creating task without custom fields", list_id)
-                payload_no_cf = dict(base_payload)
-                payload_no_cf.pop("custom_fields", None)
-                # чтобы не словить ещё раз гонку — тоже без статуса
-                resp = self._post(url, payload_no_cf)
+                log.warning(
+                    "clickup:custom field limit on list %s -> creating task without custom fields",
+                    list_id,
+                )
+                payload3 = _base_payload()
+                # и без статуса — чтобы не словить ту же гонку
+                resp = self._post(url, payload3)
                 return resp.get("id")
 
+            # другое — пусть валится
             raise
 
     def update_task_status(self, task_id: str, status: str) -> None:
         url = f"{CLICKUP_BASE}/task/{task_id}"
         self._put(url, {"status": status})
 
-    # ---------- higher level ----------
+    # ---------------- higher level ----------------
 
     def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> bool:
         clinic_name = (lead.get("clinic_name") or "").strip()
@@ -247,14 +263,25 @@ class ClickUpClient:
             if (t.get("name") or "").strip().lower() == clinic_name.lower():
                 return False
 
-        # id полей (или None, если не дали создать)
+        # пробуем получить id полей, но если ничего не вышло — просто не будем их слать
         field_ids = self._ensure_required_fields(list_id)
 
+        if not any(field_ids.values()):
+            # вообще нет полей → создаём без них
+            self.create_task(
+                list_id=list_id,
+                name=clinic_name,
+                description=lead.get("address") or "",
+                status=NEW_STATUS,
+                custom_fields=None,
+            )
+            return True
+
         custom_values = {
-            field_ids.get("Email"):    lead.get("email") or "",
-            field_ids.get("Website"):  lead.get("website") or "",
+            field_ids.get("Email"): lead.get("email") or "",
+            field_ids.get("Website"): lead.get("website") or "",
             field_ids.get("Facebook"): lead.get("facebook") or "",
-            field_ids.get("Instagram"):lead.get("instagram") or "",
+            field_ids.get("Instagram"): lead.get("instagram") or "",
             field_ids.get("LinkedIn"): lead.get("linkedin") or "",
         }
 
@@ -271,26 +298,27 @@ class ClickUpClient:
         self.update_task_status(task_id, status)
 
     def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
-        # берём все листы спейса
         lists = self._list_lists_in_space()
         for lst in lists:
             lid = lst.get("id")
             if not lid:
                 continue
-
             tasks = self.get_leads_from_list(lid)
             fields_map = self._list_custom_fields(lid)
             email_field_id = fields_map.get("Email")
             if not email_field_id:
                 continue
-
             for t in tasks:
                 for cf in t.get("custom_fields", []):
                     if (
                         cf.get("id") == email_field_id
                         and (cf.get("value") or "").lower() == email_addr.lower()
                     ):
-                        return {"task_id": t["id"], "clinic_name": t.get("name") or "", "list_id": lid}
+                        return {
+                            "task_id": t["id"],
+                            "clinic_name": t.get("name") or "",
+                            "list_id": lid,
+                        }
         return None
 
 
