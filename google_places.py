@@ -1,21 +1,20 @@
 # google_places.py
 import os
-import time
 import logging
 import requests
 from typing import List, Dict, Any
 
 log = logging.getLogger("google_places")
 
-# читаем оба варианта имён, чтобы не было "0 places" из-за названия
+# читаем оба варианта имён
 API_KEY = (
     os.getenv("GOOGLE_PLACES_API_KEY")
     or os.getenv("GOOGLE_API_KEY")
     or ""
 ).strip()
 
-BASE_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-SESSION = requests.Session()
+# ===== НОВЫЙ ЭНДПОИНТ ДЛЯ PLACES API (NEW) =====
+BASE_URL = "https://places.googleapis.com/v1/places:searchText"
 
 
 class GooglePlacesClient:
@@ -23,69 +22,87 @@ class GooglePlacesClient:
         self.api_key = (api_key or API_KEY).strip()
         if not self.api_key:
             log.error("GooglePlacesClient: API key is empty! Set GOOGLE_PLACES_API_KEY or GOOGLE_API_KEY")
+        
+        # Для нового API ключ передаётся в хедерах
+        self.session = requests.Session()
+        self.session.headers.update({
+            "X-Goog-Api-Key": self.api_key,
+            "Content-Type": "application/json"
+        })
 
-    def _text_search_all_pages(self, query: str, max_pages: int = 4) -> List[Dict[str, Any]]:
+    def _text_search(self, query: str) -> List[Dict[str, Any]]:
         """
-        Собираем все страницы textsearch.
+        Выполняет ОДИН запрос к searchText.
+        Пейджинг здесь не поддерживается со стороны Google.
         """
         if not self.api_key:
             return []
 
-        results: List[Dict[str, Any]] = []
-        params = {
-            "query": query,
-            "key": self.api_key,
-            # можно добавить: "region": "us"
+        # ВАЖНО: Маска полей. Указываем, ЧТО мы хотим получить.
+        # id = (старый place_id), displayName = (старое name)
+        field_mask = "places.id,places.displayName,places.formattedAddress,places.websiteUri"
+
+        # Новый API требует POST-запрос с JSON-телом
+        payload = {
+            "textQuery": query,
+            "maxResultCount": 20,  # Это максимум для searchText
+            "fieldMask": field_mask
         }
-        page = 0
 
-        while True:
-            r = SESSION.get(BASE_URL, params=params, timeout=15)
+        try:
+            r = self.session.post(BASE_URL, json=payload, timeout=15)
+            # Проверка на 4xx/5xx ошибки
+            r.raise_for_status()
+            
             data = r.json()
+            # Новый API возвращает { "places": [...] }
+            return data.get("places", [])
 
-            status = data.get("status")
-            if status == "REQUEST_DENIED":
-                log.error("Google Places denied request for %s: %s", query, data.get("error_message"))
-                break
-            if status not in ("OK", "ZERO_RESULTS"):
-                log.warning("Google Places returned %s for %s", status, query)
-                break
-
-            batch = data.get("results", [])
-            results.extend(batch)
-
-            next_token = data.get("next_page_token")
-            page += 1
-            if not next_token:
-                break
-            if page >= max_pages:
-                break
-
-            # у Google нужно подождать перед следующим листом
-            time.sleep(2)
-            params = {
-                "pagetoken": next_token,
-                "key": self.api_key,
-            }
-
-        return results
+        except requests.exceptions.HTTPError as e:
+            log.error(
+                "Google Places (New) HTTP error for query '%s': %s - %s",
+                query, e.response.status_code, e.response.text
+            )
+            if "has not been used" in e.response.text or "API_NOT_ACTIVATED" in e.response.text:
+                 log.error(
+                     "!!! КРИТИЧНО: 'Places API (New)' не включен в Google Cloud Console. "
+                     "Нужно зайти и включить именно 'Places API (New)'."
+                 )
+            return []
+        except Exception as e:
+            log.error("Google Places (New) generic error for query '%s': %s", query, e)
+            return []
 
     def search(self, query: str) -> List[Dict[str, Any]]:
-        raw = self._text_search_all_pages(query)
+        # Вызываем нашу новую функцию
+        raw_places = self._text_search(query)
+        
         places: List[Dict[str, Any]] = []
-        for item in raw:
+        for item in raw_places:
+            # 'name' теперь в 'displayName'
+            name = (item.get("displayName") or {}).get("text", "")
+            # 'place_id' теперь 'id'
+            place_id = item.get("id")
+            # 'formatted_address' теперь 'formattedAddress'
+            address = item.get("formattedAddress")
+            # 'website' теперь 'websiteUri' (и он теперь должен быть!)
+            website = item.get("websiteUri", "")
+
+            if not place_id or not name:
+                continue  # Пропускаем неполные данные
+
             places.append(
                 {
-                    "place_id": item.get("place_id"),
-                    "name": item.get("name"),
-                    "address": item.get("formatted_address"),
-                    # textsearch почти никогда не даёт сайт/соцсети, поэтому будут пустые
-                    "website": "",
+                    "place_id": place_id,
+                    "name": name,
+                    "address": address,
+                    "website": website,
+                    # Соцсетей по-прежнему нет в этом поиске
                     "facebook": "",
                     "instagram": "",
                     "linkedin": "",
                     "source": "google",
                 }
             )
-        log.info("google (new) %r -> %d places", query, len(places))
+        log.info("google (new API) %r -> %d places", query, len(places))
         return places
