@@ -8,84 +8,71 @@ import requests
 
 log = logging.getLogger("google_places")
 
-GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
-TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
+TEXTSEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 
 
 class GooglePlacesClient:
-    """
-    Минимальный клиент под наш сценарий:
-    - text search с автопагинацией
-    - details по place_id (на будущее)
-    """
-
     def __init__(self, api_key: Optional[str] = None) -> None:
-        self.api_key = api_key or GOOGLE_PLACES_API_KEY
+        self.api_key = api_key or API_KEY
         if not self.api_key:
-            # лучше уронить сервис при старте, чем молча ничего не собирать
             raise RuntimeError("GOOGLE_PLACES_API_KEY is not set")
-
         self.session = requests.Session()
 
-    # -------- public --------
+    # ─────────────────────────────
+    # ВАЖНО: leads.py зовёт client.search(...)
+    # мы держим этот метод и просто прокидываем в search_text
+    # ─────────────────────────────
+    def search(self, query: str) -> List[Dict[str, Any]]:
+        return self.search_text(query)
 
     def search_text(self, query: str) -> List[Dict[str, Any]]:
         """
-        Делает text search и САМ проходит все страницы,
-        пока Google отдаёт next_page_token.
-        Возвращает список place-объектов (как в ответе Google).
+        Собираем все страницы textsearch для одного запроса.
+        Google может отдавать next_page_token — перелистываем пока есть.
         """
-        all_results: List[Dict[str, Any]] = []
-
-        params = {
-            "query": query,
-            "key": self.api_key,
-        }
-
+        all_res: List[Dict[str, Any]] = []
+        params = {"query": query, "key": self.api_key}
         next_token: Optional[str] = None
 
         while True:
             if next_token:
-                params = {
-                    "pagetoken": next_token,
-                    "key": self.api_key,
-                }
+                params = {"pagetoken": next_token, "key": self.api_key}
 
-            resp = self.session.get(TEXT_SEARCH_URL, params=params, timeout=20)
-            data = resp.json()
-
+            r = self.session.get(TEXTSEARCH_URL, params=params, timeout=20)
+            data = r.json()
             status = data.get("status")
+
             if status not in ("OK", "ZERO_RESULTS"):
-                # если что-то пошло не так — выходим с тем, что есть
-                log.warning("google_places: search '%s' -> status %s", query, status)
+                # это мы уже видели: REQUEST_DENIED, если legacy и т.п.
+                log.warning("google textsearch status=%s data=%s", status, data)
                 break
 
             results = data.get("results", [])
-            all_results.extend(results)
+            all_res.extend(results)
 
             next_token = data.get("next_page_token")
             if not next_token:
                 break
 
-            # у Google next_page_token активируется не сразу
+            # токен активируется не сразу
             time.sleep(2.0)
 
-        log.info("google (new) '%s' -> %d places", query, len(all_results))
-        return all_results
+        log.info("google (new) '%s' -> %d places", query, len(all_res))
+        return all_res
 
     def get_details(self, place_id: str) -> Dict[str, Any]:
         """
-        Если когда-то понадобится добрать телефон/сайт.
-        Сейчас leads.py может это не вызывать — просто держим тут.
+        Детали по месту — пробуем вытащить сайт/телефон/адрес.
         """
         params = {
             "place_id": place_id,
             "key": self.api_key,
             "fields": "name,formatted_address,formatted_phone_number,website,url",
         }
-        resp = self.session.get(DETAILS_URL, params=params, timeout=20)
-        data = resp.json()
+        r = self.session.get(DETAILS_URL, params=params, timeout=20)
+        data = r.json()
         if data.get("status") != "OK":
             return {}
         return data.get("result", {})
