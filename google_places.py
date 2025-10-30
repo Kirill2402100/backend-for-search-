@@ -1,76 +1,61 @@
 # google_places.py
 import os
-import time
 import logging
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import requests
 
 log = logging.getLogger("google_places")
 
-API_KEY = (
-    os.getenv("GOOGLE_PLACES_API_KEY")
-    or os.getenv("GOOGLE_API_KEY")
-    or ""
-).strip()
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
-BASE_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-SESSION = requests.Session()
+class GooglePlacesError(Exception):
+    pass
 
 
 class GooglePlacesClient:
-    def __init__(self, api_key: str | None = None):
-        self.api_key = (api_key or API_KEY).strip()
-        if not self.api_key:
-            log.error("GooglePlacesClient: API key is empty")
-
-    def _search_pages(self, query: str, max_pages: int = 4) -> List[Dict[str, Any]]:
-        if not self.api_key:
-            return []
-
-        params = {"query": query, "key": self.api_key}
-        all_results: List[Dict[str, Any]] = []
-        page = 0
-
-        while True:
-            r = SESSION.get(BASE_URL, params=params, timeout=15)
-            data = r.json()
-            status = data.get("status")
-            if status == "REQUEST_DENIED":
-                log.error("Google denied %s: %s", query, data.get("error_message"))
-                break
-            if status not in ("OK", "ZERO_RESULTS"):
-                log.warning("Google status %s for %s", status, query)
-                break
-
-            results = data.get("results", [])
-            all_results.extend(results)
-
-            next_token = data.get("next_page_token")
-            page += 1
-            if not next_token or page >= max_pages:
-                break
-
-            time.sleep(2)
-            params = {"pagetoken": next_token, "key": self.api_key}
-
-        return all_results
+    """
+    Клиент под новый Google Places API (New), текстовый поиск.
+    Документация: https://developers.google.com/maps/documentation/places/web-service/search-text
+    """
+    def __init__(self) -> None:
+        if not GOOGLE_PLACES_API_KEY:
+            raise RuntimeError("GOOGLE_PLACES_API_KEY is not set")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.websiteUri"
+        })
 
     def search(self, query: str) -> List[Dict[str, Any]]:
-        raw = self._search_pages(query)
-        places: List[Dict[str, Any]] = []
-        for item in raw:
-            places.append(
+        url = "https://places.googleapis.com/v1/places:searchText"
+        payload = {
+            "textQuery": query,
+            # можно сюда добавить "openNow": False/True, regionCode и т.д.
+        }
+        r = self.session.post(url, json=payload, timeout=20)
+        if r.status_code >= 300:
+            raise GooglePlacesError(f"google places error {r.status_code}: {r.text}")
+
+        data = r.json()
+        places = data.get("places", [])
+        out: List[Dict[str, Any]] = []
+
+        for p in places:
+            place_id = p.get("id") or ""
+            name = (p.get("displayName") or {}).get("text") or ""
+            address = p.get("formattedAddress") or ""
+            website = p.get("websiteUri") or ""
+
+            out.append(
                 {
-                    "place_id": item.get("place_id"),
-                    "name": item.get("name"),
-                    "address": item.get("formatted_address"),
-                    "website": "",     # textsearch почти никогда не присылает
-                    "facebook": "",
-                    "instagram": "",
-                    "linkedin": "",
-                    "source": "google",
+                    "place_id": place_id,
+                    "name": name,
+                    "formatted_address": address,
+                    "website": website,
                 }
             )
-        log.info("google (new) %r -> %d places", query, len(places))
-        return places
+
+        log.info("google (new) '%s' -> %d places", query, len(out))
+        return out
