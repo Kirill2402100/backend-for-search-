@@ -13,6 +13,7 @@ NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
 INVALID_STATUS = "INVALID"
+REPLIED_STATUS = "REPLIED"   # ← ЭТОГО НЕ ХВАТАЛО
 
 # что хотим видеть в каждом листе
 REQUIRED_STATUSES = [
@@ -20,6 +21,8 @@ REQUIRED_STATUSES = [
     {"status": READY_STATUS, "type": "open", "orderindex": 1, "color": "#f0ad4e"},
     {"status": SENT_STATUS, "type": "done", "orderindex": 2, "color": "#5cb85c"},
     {"status": INVALID_STATUS, "type": "closed", "orderindex": 3, "color": "#d9534f"},
+    # чтобы /replies мог двигать задачу в отдельную колонку
+    {"status": REPLIED_STATUS, "type": "done", "orderindex": 4, "color": "#8e44ad"},
 ]
 
 # кастомные поля, которые мы бы хотели (если тариф даст)
@@ -41,14 +44,12 @@ class ClickUpClient:
         self.token = os.getenv("CLICKUP_API_TOKEN") or ""
         self.team_id = os.getenv("CLICKUP_TEAM_ID") or ""
         self.space_id = os.getenv("CLICKUP_SPACE_ID") or ""
-        # не обязателен
+        # может быть пустым
         self.template_list_id = os.getenv("CLICKUP_TEMPLATE_LIST_ID") or ""
         # кэш: "NY" -> list_id
         self._state_lists: Dict[str, str] = {}
 
-    # -------------------------------------------------
-    # low-level http
-    # -------------------------------------------------
+    # -------------------- HTTP --------------------
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": self.token, "Content-Type": "application/json"}
 
@@ -70,9 +71,7 @@ class ClickUpClient:
             raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
         return r.json()
 
-    # -------------------------------------------------
-    # helpers
-    # -------------------------------------------------
+    # -------------------- helpers --------------------
     def _space_lists(self) -> List[Dict[str, Any]]:
         if not self.space_id:
             raise ClickUpError("CLICKUP_SPACE_ID is empty")
@@ -86,28 +85,20 @@ class ClickUpClient:
                 return str(lst.get("id"))
         return None
 
-    # -------------------------------------------------
-    # statuses
-    # -------------------------------------------------
+    # -------------------- statuses --------------------
     def _ensure_statuses_on_list(self, list_id: str) -> None:
         """
-        Принудительно кладём в лист наши 4 статуса,
-        даже если ClickUp создал его с русскими/дефолтными.
+        Насильно приводим лист к нашим 5 статусам.
         """
         try:
             url = f"{CLICKUP_API}/list/{list_id}"
-            payload = {
-                "statuses": REQUIRED_STATUSES,
-            }
+            payload = {"statuses": REQUIRED_STATUSES}
             self._put(url, payload)
             log.info("clickup:normalized statuses on list %s", list_id)
         except Exception as e:
-            # не хотим падать из-за этого
             log.warning("clickup:cannot normalize statuses on list %s: %s", list_id, e)
 
-    # -------------------------------------------------
-    # custom fields
-    # -------------------------------------------------
+    # -------------------- custom fields --------------------
     def _list_custom_fields(self, list_id: str) -> List[Dict[str, Any]]:
         url = f"{CLICKUP_API}/list/{list_id}/field"
         data = self._get(url)
@@ -117,7 +108,7 @@ class ClickUpClient:
         url = f"{CLICKUP_API}/list/{list_id}/field"
         payload = {"name": name, "type": field_type}
         r = requests.post(url, headers=self._headers(), json=payload, timeout=20)
-        # тут у тебя план часто возвращает 400 FIELD_033 -> просто варним и идём дальше
+        # на бесплатном/ограниченном плане тут бывает 400 FIELD_033
         if r.status_code >= 400:
             log.warning("clickup:cannot create field %s on list %s (no id in resp)", name, list_id)
             return None
@@ -129,10 +120,6 @@ class ClickUpClient:
         return str(fid)
 
     def _ensure_required_fields(self, list_id: str) -> Dict[str, str]:
-        """
-        Возвращаем карту: 'Email' -> field_id
-        то что не удалось создать — просто не кладём в карту
-        """
         existing = {f.get("name"): str(f.get("id")) for f in self._list_custom_fields(list_id) if f.get("id")}
         out: Dict[str, str] = {}
         for fname, cfg in REQUIRED_FIELDS.items():
@@ -144,9 +131,7 @@ class ClickUpClient:
                     out[fname] = fid
         return out
 
-    # -------------------------------------------------
-    # list management
-    # -------------------------------------------------
+    # -------------------- list management --------------------
     def get_or_create_list_for_state(self, state: str) -> str:
         if state in self._state_lists:
             return self._state_lists[state]
@@ -154,39 +139,31 @@ class ClickUpClient:
         list_name = f"LEADS-{state}"
         list_id = self._find_list_by_name(list_name)
         if not list_id:
-            # создаём прямо в space
             if not self.space_id:
                 raise ClickUpError("CLICKUP_SPACE_ID is empty")
             url = f"{CLICKUP_API}/space/{self.space_id}/list"
-            payload = {"name": list_name}
-            data = self._post(url, payload)
+            data = self._post(url, {"name": list_name})
             list_id = str(data.get("id"))
             log.info("clickup:created list %s (%s)", list_id, list_name)
 
-        # в любом случае ДОВОДИМ СТАТУСЫ ДО НУЖНЫХ
+        # каждый раз приводим к нашим статусам
         self._ensure_statuses_on_list(list_id)
-        # и пытаемся (по возможности) добавить поля
+        # и пытаемся (если можно) завести нужные поля
         self._ensure_required_fields(list_id)
 
         self._state_lists[state] = list_id
         return list_id
 
-    # -------------------------------------------------
-    # tasks
-    # -------------------------------------------------
+    # -------------------- tasks --------------------
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
         """
-        Забираем ВСЕ задачи из списка постранично.
-        ClickUp даёт по 100 штук.
+        Забираем все задачи постранично (по 100).
         """
         all_tasks: List[Dict[str, Any]] = []
         page = 0
         while True:
             url = f"{CLICKUP_API}/list/{list_id}/task"
-            params = {
-                "page": page,
-                "include_closed": True,
-            }
+            params = {"page": page, "include_closed": True}
             data = self._get(url, params=params)
             tasks = data.get("tasks", [])
             all_tasks.extend(tasks)
@@ -194,19 +171,6 @@ class ClickUpClient:
                 break
             page += 1
         return all_tasks
-
-    def find_task_by_email(self, email_value: str) -> Optional[Dict[str, Any]]:
-        # очень простой перебор по всем листам штатов из кэша
-        for state, list_id in self._state_lists.items():
-            tasks = self.get_leads_from_list(list_id)
-            for t in tasks:
-                if t.get("text_content") == email_value:
-                    return {
-                        "task_id": t.get("id"),
-                        "clinic_name": t.get("name"),
-                        "state": state,
-                    }
-        return None
 
     def create_task(
         self,
@@ -216,18 +180,15 @@ class ClickUpClient:
         custom_fields: Optional[Dict[str, str]] = None,
     ) -> str:
         url = f"{CLICKUP_API}/list/{list_id}/task"
-        payload: Dict[str, Any] = {
-            "name": name,
-            "status": status,
-        }
+        payload: Dict[str, Any] = {"name": name, "status": status}
         if custom_fields:
-            # custom_fields должен быть в формате:
-            # [{"id": "...", "value": "..."}, ...]
-            payload["custom_fields"] = [{"id": fid, "value": val} for fid, val in custom_fields.items() if val]
+            payload["custom_fields"] = [
+                {"id": fid, "value": val} for fid, val in custom_fields.items() if val
+            ]
 
         r = requests.post(url, headers=self._headers(), json=payload, timeout=20)
         if r.status_code == 400 and "Status not found" in r.text:
-            # значит лист опять откатил нам статусы → ещё раз нормализуем и пробуем без статуса
+            # список снова создался с дефолтными статусами → нормализуем и пробуем без статуса
             self._ensure_statuses_on_list(list_id)
             payload.pop("status", None)
             r = requests.post(url, headers=self._headers(), json=payload, timeout=20)
@@ -241,17 +202,6 @@ class ClickUpClient:
         return task_id
 
     def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> bool:
-        """
-        Сейчас у нас простая логика: всегда создаём.
-        lead = {
-          "name": "...",
-          "email": "...",
-          "website": "...",
-          "facebook": "...",
-          ...
-        }
-        """
-        # сопоставляем поля, которые реально есть
         field_map = self._ensure_required_fields(list_id)
 
         cf_values: Dict[str, str] = {}
@@ -266,7 +216,6 @@ class ClickUpClient:
         if "LinkedIn" in field_map and lead.get("linkedin"):
             cf_values[field_map["LinkedIn"]] = lead["linkedin"]
 
-        # создаём задачу
         try:
             self.create_task(
                 list_id=list_id,
@@ -276,7 +225,7 @@ class ClickUpClient:
             )
             return True
         except ClickUpError as e:
-            # если тариф не даёт создавать поля — создаём вообще без них
+            # у плана кончились кастомные — создаём без них
             if "Custom field usages exceeded" in str(e):
                 log.warning(
                     "clickup:ClickUp custom field limit reached on list %s -> creating task without custom fields",
