@@ -1,284 +1,277 @@
 # clickup_client.py
+from __future__ import annotations
+
+import os
 import logging
 from typing import Any, Dict, List, Optional
 
 import requests
-
 from config import settings
 
-logger = logging.getLogger("clickup")
+log = logging.getLogger("clickup")
 
 API_BASE = "https://api.clickup.com/api/v2"
 
-# статусы, которыми мы пользуемся по всему проекту
-NEW_STATUS = "NEW"
+# Статусы, которые используем по всему проекту
+NEW_STATUS = "NEW"                 # можно не использовать
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
-INVALID_STATUS = "INVALID"
-REPLIED_STATUS = "REPLIED"  # когда пришёл ответ по email
+REPLIED_STATUS = "REPLIED"
+INVALID_STATUS = "INVALID"         # нужен send.py
 
-# имена кастомных полей, которые мы хотим хранить в таске
-CF_CLINIC = "clinic"          # название клиники
-CF_WEBSITE = "website"        # сайт
-CF_EMAIL = "email"            # email
-CF_PHONE = "phone"            # телефон
-CF_SIGNATURE = "signature"    # кто писал / подпись
+# как будут называться листы для штатов
+LIST_PREFIX = "LEADS-"
 
 
 class ClickUpClient:
-    def __init__(self, token: str, space_id: str, team_id: str):
+    def __init__(self, token: str, team_id: str, space_id: str):
         self.token = token
-        self.space_id = space_id
-        self.team_id = team_id
-        self._headers = {
+        self.team_id = str(team_id)
+        self.space_id = str(space_id)
+        self.headers = {
             "Authorization": self.token,
             "Content-Type": "application/json",
         }
 
-    # ------------- низкоуровневые запросы -------------
-
-    def _get(self, path: str, **params) -> Dict[str, Any]:
-        url = f"{API_BASE}{path}"
-        r = requests.get(url, headers=self._headers, params=params or None, timeout=15)
-        if not r.ok:
+    # ------------------------------------------------------------------
+    # ВСПОМОГАТЕЛЬНЫЕ HTTP
+    # ------------------------------------------------------------------
+    def _get(self, url: str, **kwargs) -> Dict[str, Any]:
+        r = requests.get(url, headers=self.headers, timeout=15, **kwargs)
+        if r.status_code >= 400:
             raise RuntimeError(f"ClickUp error: {r.status_code} {r.text}")
         return r.json()
 
-    def _post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{API_BASE}{path}"
-        r = requests.post(url, headers=self._headers, json=json, timeout=15)
-        if not r.ok:
+    def _post(self, url: str, json: Dict[str, Any]) -> Dict[str, Any]:
+        r = requests.post(url, headers=self.headers, json=json, timeout=15)
+        if r.status_code >= 400:
             raise RuntimeError(f"ClickUp error: {r.status_code} {r.text}")
         return r.json()
 
-    def _put(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{API_BASE}{path}"
-        r = requests.put(url, headers=self._headers, json=json, timeout=15)
-        if not r.ok:
+    def _put(self, url: str, json: Dict[str, Any]) -> Dict[str, Any]:
+        r = requests.put(url, headers=self.headers, json=json, timeout=15)
+        if r.status_code >= 400:
             raise RuntimeError(f"ClickUp error: {r.status_code} {r.text}")
         return r.json()
 
-    # ------------- служебное -------------
-
-    def _list_custom_fields_map(self, list_id: str) -> Dict[str, Dict[str, Any]]:
-        """
-        Возвращает словарь вида:
-        {
-          "clinic": {...},
-          "website": {...},
-          ...
-        }
-        и главное — не падает, если ClickUp прислал что-то странное.
-        """
-        try:
-            data = self._get(f"/list/{list_id}/field")
-        except RuntimeError as e:
-            logger.warning("cannot load list fields for %s: %s", list_id, e)
-            return {}
-
-        fields = data.get("fields") or []
-        out: Dict[str, Dict[str, Any]] = {}
-        for f in fields:
-            # тут и был краш: f оказалось строкой
-            if not isinstance(f, dict):
-                continue
-            name = (f.get("name") or "").strip().lower()
-            if not name:
-                continue
-            out[name] = f
-        return out
-
-    def _ensure_statuses_for_list(self, list_id: str) -> None:
-        """
-        Мы хотим, чтобы в листе были 4 статуса: NEW, READY, SENT, INVALID.
-        Если лист только что создан — мы их создаём.
-        """
-        # в ClickUp статусы задаются при создании листа,
-        # поэтому тут чаще всего ничего делать не надо.
-        # но пусть будет отдельная функция — на будущее.
-        pass
-
-    # ------------- публичные методы -------------
-
+    # ------------------------------------------------------------------
+    # ЛИСТ ДЛЯ ШТАТА
+    # ------------------------------------------------------------------
     def get_or_create_list_for_state(self, state: str) -> str:
         """
-        Находит или создаёт список LEADS-{state} в нужном Space.
-        Возвращает list_id.
+        Ищем лист LEADS-<STATE> в space.
+        Если нет — создаём.
+        Возвращаем list_id.
         """
         state = state.upper()
-        target_name = f"LEADS-{state}"
+        target_name = f"{LIST_PREFIX}{state}"
 
-        # 1. пробуем найти
-        lists_data = self._get(f"/space/{self.space_id}/list")
-        for lst in lists_data.get("lists", []):
+        # 1) получить все листы в space
+        url = f"{API_BASE}/space/{self.space_id}/list"
+        data = self._get(url)
+
+        for lst in data.get("lists", []):
             if lst.get("name") == target_name:
-                return str(lst.get("id"))
+                return str(lst["id"])
 
-        # 2. нет — создаём
+        # 2) нет — создаём
         payload = {
             "name": target_name,
-            "content": f"Leads for {state}",
-            "statuses": [
-                {"status": NEW_STATUS, "orderindex": 0, "color": "#d3d3d3"},
-                {"status": READY_STATUS, "orderindex": 1, "color": "#6bc950"},
-                {"status": SENT_STATUS, "orderindex": 2, "color": "#3388ff"},
-                {"status": INVALID_STATUS, "orderindex": 3, "color": "#ff6666"},
-            ],
+            "content": f"Leads for state {state}",
+            "status": "open",
         }
-        created = self._post(f"/space/{self.space_id}/list", payload)
-        list_id = str(created.get("id"))
-        logger.info("created list %s for state %s", list_id, state)
-        return list_id
+        url = f"{API_BASE}/space/{self.space_id}/list"
+        created = self._post(url, json=payload)
+        return str(created["id"])
 
-    def create_lead_task(
-        self,
-        list_id: str,
-        clinic_name: str,
-        website: Optional[str] = None,
-        email_: Optional[str] = None,
-        phone: Optional[str] = None,
-        signature: Optional[str] = None,
-        status: str = NEW_STATUS,
-    ) -> str:
+    # ------------------------------------------------------------------
+    # CUSTOM FIELDS
+    # ------------------------------------------------------------------
+    def _list_custom_fields_map(self, list_id: str) -> Dict[str, str]:
         """
-        Создаём задачу-лид и заполняем её кастомные поля, если они есть в листе.
+        Возвращает словарь:
+            {'clinic_name': <field_id>, 'email': <field_id>, ...}
+        если поле есть в листе.
+        Мы ориентируемся на человекочитаемые названия полей.
         """
-        fields_map = self._list_custom_fields_map(list_id)
+        url = f"{API_BASE}/list/{list_id}/field"
+        data = self._get(url)
 
-        custom_fields: List[Dict[str, Any]] = []
+        fields = data.get("fields", [])
+        out: Dict[str, str] = {}
 
-        def _maybe_add(cf_name: str, value: Optional[str]):
-            if not value:
-                return
-            fld = fields_map.get(cf_name)
-            if not fld:
-                return
-            custom_fields.append(
-                {
-                    "id": fld["id"],
-                    "value": value,
-                }
-            )
+        for f in fields:
+            if not isinstance(f, dict):
+                # в старых ответах у тебя как раз была строка -> поэтому тут защита
+                continue
+            name = (f.get("name") or "").strip().lower()
+            fid = str(f.get("id") or "")
+            if not fid:
+                continue
 
-        _maybe_add("clinic", clinic_name)
-        _maybe_add("website", website)
-        _maybe_add("email", email_)
-        _maybe_add("phone", phone)
-        _maybe_add("signature", signature)
-
-        payload = {
-            "name": clinic_name,
-            "status": status,
-        }
-        if custom_fields:
-            payload["custom_fields"] = custom_fields
-
-        data = self._post(f"/list/{list_id}/task", payload)
-        return str(data.get("id"))
-
-    def move_lead_to_status(self, task_id: str, status: str) -> None:
-        self._put(f"/task/{task_id}", {"status": status})
-
-    def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        """
-        Возвращаем список наших "лидов" в виде простых словарей:
-        {
-          "task_id": "...",
-          "clinic_name": "...",
-          "email": "...",
-          "website": "...",
-          "phone": "...",
-          "status": "READY" / "SENT" / ...
-        }
-        """
-        # загрузим кастомные поля (чтобы понимать id полей)
-        fields_map = self._list_custom_fields_map(list_id)
-        # забираем сами таски
-        tasks_data = self._get(f"/list/{list_id}/task", archived=False)
-        tasks = tasks_data.get("tasks", [])
-
-        out: List[Dict[str, Any]] = []
-        for t in tasks:
-            task_id = str(t.get("id"))
-            name = t.get("name") or ""
-            status = (t.get("status") or {}).get("status") or NEW_STATUS
-
-            cf_values = t.get("custom_fields") or []
-            cf_by_id = {str(cf.get("id")): cf for cf in cf_values if isinstance(cf, dict)}
-
-            def _get_cf(name: str) -> Optional[str]:
-                fld = fields_map.get(name)
-                if not fld:
-                    return None
-                val_obj = cf_by_id.get(str(fld["id"]))
-                if not val_obj:
-                    return None
-                val = val_obj.get("value")
-                if isinstance(val, str):
-                    return val
-                # иногда clickup шлёт {"value": {"text": "..."}}
-                if isinstance(val, dict):
-                    return val.get("text") or val.get("email") or val.get("phone")
-                return None
-
-            out.append(
-                {
-                    "task_id": task_id,
-                    "clinic_name": name,
-                    "email": _get_cf("email"),
-                    "website": _get_cf("website"),
-                    "phone": _get_cf("phone"),
-                    "signature": _get_cf("signature"),
-                    "status": status,
-                }
-            )
+            if name in ("clinic", "clinic name", "clinic_name", "name"):
+                out["clinic_name"] = fid
+            elif name in ("email", "e-mail", "mail"):
+                out["email"] = fid
+            elif name in ("phone", "phone number", "телефон"):
+                out["phone"] = fid
+            elif name in ("website", "site", "web"):
+                out["website"] = fid
+            elif name in ("city",):
+                out["city"] = fid
+            elif name in ("source", "источник"):
+                out["source"] = fid
+            elif name in ("category", "категория", "type"):
+                out["category"] = fid
+            elif name in ("status",):
+                out["status"] = fid
 
         return out
 
-    def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # ЧТЕНИЕ ЛИДОВ ИЗ ЛИСТА
+    # ------------------------------------------------------------------
+    def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
         """
-        Проходим по всем спискам в нашем Space и ищем таску, у которой кастомное поле email == email_addr.
-        Это нужно, когда мы забираем ответы с почты.
+        Возвращает все задачи в листе в нормализованном виде.
         """
-        lists_data = self._get(f"/space/{self.space_id}/list")
+        url = f"{API_BASE}/list/{list_id}/task"
+        data = self._get(url)
+
+        field_map = self._list_custom_fields_map(list_id)
+        tasks_out: List[Dict[str, Any]] = []
+
+        for t in data.get("tasks", []):
+            task_id = str(t.get("id") or "")
+            name = t.get("name") or ""
+            status = (t.get("status") or {}).get("status", "") or (t.get("status") or {}).get("status", "")
+
+            norm: Dict[str, Any] = {
+                "task_id": task_id,
+                "name": name,
+                "status": status,
+                "clinic_name": name,  # по умолчанию
+                "email": "",
+                "phone": "",
+                "website": "",
+                "city": "",
+                "source": "",
+                "category": "",
+            }
+
+            # custom_fields -> вытаскиваем по id
+            for cf in t.get("custom_fields", []):
+                fid = str(cf.get("id") or "")
+                val = cf.get("value")
+                if not fid:
+                    continue
+
+                if field_map.get("clinic_name") == fid and val:
+                    norm["clinic_name"] = val
+                elif field_map.get("email") == fid and val:
+                    norm["email"] = val
+                elif field_map.get("phone") == fid and val:
+                    norm["phone"] = val
+                elif field_map.get("website") == fid and val:
+                    norm["website"] = val
+                elif field_map.get("city") == fid and val:
+                    norm["city"] = val
+                elif field_map.get("source") == fid and val:
+                    norm["source"] = val
+                elif field_map.get("category") == fid and val:
+                    norm["category"] = val
+                elif field_map.get("status") == fid and val:
+                    norm["status"] = val
+
+            tasks_out.append(norm)
+
+        return tasks_out
+
+    # ------------------------------------------------------------------
+    # СОЗДАНИЕ / ОБНОВЛЕНИЕ ЛИДА
+    # ------------------------------------------------------------------
+    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> str:
+        """
+        Создаёт задачу-лид в указанном листе и проставляет кастомные поля.
+        Пока делаем "create always", а дедупликацию ты делаешь в leads.py.
+        Возвращает task_id.
+        """
+        name = lead.get("clinic_name") or lead.get("name") or "Clinic"
+        status = lead.get("status") or READY_STATUS
+
+        # 1. создаём задачу
+        create_url = f"{API_BASE}/list/{list_id}/task"
+        payload = {
+            "name": name,
+            "status": status,
+        }
+        created = self._post(create_url, json=payload)
+        task_id = str(created.get("id") or created.get("task", {}).get("id") or "")
+        if not task_id:
+            raise RuntimeError("ClickUp: task was not created")
+
+        # 2. проставляем кастомные поля, если они есть
+        field_map = self._list_custom_fields_map(list_id)
+
+        def _set_cf(key: str, value: Any):
+            fid = field_map.get(key)
+            if not fid or value in (None, "", []):
+                return
+            url = f"{API_BASE}/task/{task_id}/field/{fid}"
+            self._post(url, json={"value": value})
+
+        _set_cf("clinic_name", lead.get("clinic_name"))
+        _set_cf("email", lead.get("email"))
+        _set_cf("phone", lead.get("phone"))
+        _set_cf("website", lead.get("website"))
+        _set_cf("city", lead.get("city"))
+        _set_cf("source", lead.get("source"))
+        _set_cf("category", lead.get("category"))
+        _set_cf("status", status)
+
+        return task_id
+
+    # ------------------------------------------------------------------
+    # ПОИСК ЗАДАЧИ ПО EMAIL (для /replies)
+    # ------------------------------------------------------------------
+    def find_task_by_email(self, email_val: str) -> Optional[Dict[str, Any]]:
+        """
+        Очень простой поиск: пробегаемся по всем листам space и ищем задачу,
+        у которой кастомное поле email == email_val.
+        Для твоего текущего размера базы этого достаточно.
+        """
+        # сначала получим все листы
+        lists_data = self._get(f"{API_BASE}/space/{self.space_id}/list")
         for lst in lists_data.get("lists", []):
-            list_id = str(lst.get("id"))
-            fields_map = self._list_custom_fields_map(list_id)
-            email_field = fields_map.get("email")
-            if not email_field:
+            list_id = str(lst["id"])
+            field_map = self._list_custom_fields_map(list_id)
+            email_fid = field_map.get("email")
+            if not email_fid:
                 continue
 
-            tasks_data = self._get(f"/list/{list_id}/task", archived=False)
-            for t in tasks_data.get("tasks", []):
-                cf_values = t.get("custom_fields") or []
-                for cf in cf_values:
-                    if not isinstance(cf, dict):
-                        continue
-                    if str(cf.get("id")) != str(email_field["id"]):
-                        continue
-                    val = cf.get("value")
-                    if isinstance(val, str) and val.lower() == email_addr.lower():
-                        return {
-                            "task_id": str(t.get("id")),
-                            "clinic_name": t.get("name") or "",
-                            "list_id": list_id,
-                        }
+            tasks = self.get_leads_from_list(list_id)
+            for t in tasks:
+                if (t.get("email") or "").lower() == email_val.lower():
+                    return {
+                        "task_id": t["task_id"],
+                        "clinic_name": t.get("clinic_name") or t.get("name") or "",
+                        "list_id": list_id,
+                    }
         return None
 
+    # ------------------------------------------------------------------
+    # ПЕРЕНОС ЛИДА В СТАТУС
+    # ------------------------------------------------------------------
+    def move_lead_to_status(self, task_id: str, status: str) -> None:
+        url = f"{API_BASE}/task/{task_id}"
+        self._put(url, json={"status": status})
 
-# создаём синглтон, как и раньше
+
+# ----------------------------------------------------------------------
+# Синглтон, как у тебя был раньше
+# ----------------------------------------------------------------------
 clickup_client = ClickUpClient(
     token=settings.CLICKUP_API_TOKEN,
-    space_id=settings.CLICKUP_SPACE_ID,
     team_id=settings.CLICKUP_TEAM_ID,
+    space_id=settings.CLICKUP_SPACE_ID,
 )
-
-# и экспортим статусы, чтобы другие файлы их импортировали
-__all__ = [
-    "clickup_client",
-    "NEW_STATUS",
-    "READY_STATUS",
-    "SENT_STATUS",
-    "INVALID_STATUS",
-    "REPLIED_STATUS",
-]
