@@ -1,132 +1,120 @@
 # leads.py
+from typing import List, Dict, Any
 import os
 import logging
-from typing import Dict, Any, List
 
-import requests
-
+from google_places import GooglePlacesClient
 from clickup_client import clickup_client
 
 log = logging.getLogger("leads")
 
-GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
-EMAIL_VALIDATION_API_KEY = os.getenv("EMAIL_VALIDATION_API_KEY", "")
-EMAIL_VALIDATION_PROVIDER = os.getenv("EMAIL_VALIDATION_PROVIDER", "")
-
-# мы специально НЕ даём лимит страниц — берём столько, сколько собрали из запросов
-GOOGLE_PLACES_BASE = "https://places.googleapis.com/v1/places:searchText"
-
-# базовый набор запросов по штату
-STATE_QUERIES = {
-    # штат: список поисков
-    # для FL я специально добавил больше городов
-    "NY": [
-        "dentist NY",
-        "dental clinic NY",
-        "dentist Manhattan NY",
-        "dentist Brooklyn NY",
-        "dentist Queens NY",
-        "dentist Bronx NY",
-        "dentist Staten Island NY",
-    ],
-    "FL": [
-        "dentist FL",
-        "dental clinic FL",
-        "cosmetic dentist FL",
-        "orthodontist FL",
-        "dentist Miami FL",
-        "dentist Orlando FL",
-        "dentist Tampa FL",
-        "dentist Jacksonville FL",
-        "dentist Fort Lauderdale FL",
-        "dentist West Palm Beach FL",
-    ],
+# если хочешь – можешь потом вынести в отдельный файл
+STATE_CITIES: Dict[str, List[str]] = {
+    "NY": ["New York", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island", "Long Island"],
+    "FL": ["Miami", "Orlando", "Tampa", "Jacksonville", "Fort Lauderdale", "West Palm Beach", "Tallahassee"],
+    "CA": ["Los Angeles", "San Francisco", "San Diego", "Sacramento", "San Jose", "Fresno", "Oakland"],
+    "TX": ["Houston", "Dallas", "Austin", "San Antonio", "Fort Worth", "El Paso"],
+    "IL": ["Chicago", "Aurora", "Naperville"],
+    "GA": ["Atlanta", "Savannah", "Augusta"],
+    # остальные штаты получат «общий» набор
 }
 
+# базовые фразы, которые мы комбинируем
+BASE_QUERIES = [
+    "dentist {state}",
+    "dental clinic {state}",
+    "cosmetic dentist {state}",
+    "orthodontist {state}",
+]
 
-def _google_search_one(query: str) -> List[Dict[str, Any]]:
-    if not GOOGLE_PLACES_API_KEY:
-        log.warning("GOOGLE_PLACES_API_KEY is empty -> google search skipped")
-        return []
+# что подставляем в конце для городов
+CITY_QUERIES = [
+    "dentist {city} {state}",
+    "dental clinic {city} {state}",
+]
 
-    headers = {
-        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        "X-Goog-FieldMask": (
-            "places.displayName,places.formattedAddress,places.websiteUri,"
-            "places.internationalPhoneNumber,places.googleMapsUri,"
-            "places.primaryType,places.id"
-        ),
-    }
-    payload = {"textQuery": query}
-    r = requests.post(GOOGLE_PLACES_BASE, headers=headers, json=payload, timeout=15)
-    if r.status_code >= 400:
-        log.warning("google textsearch %s -> %s %s", query, r.status_code, r.text[:200])
-        return []
-    data = r.json()
-    places = data.get("places") or []
-    log.info("leads:google (new) '%s' -> %d places", query, len(places))
-    return places
+# если вдруг кто-то опять поставит лимит в env – уважаем, но не требуем
+MAX_PLACES_ENV = os.getenv("GOOGLE_PLACES_MAX_PAGES")
 
 
-def _places_for_state(state: str) -> List[Dict[str, Any]]:
-    qs = STATE_QUERIES.get(state.upper())
-    if not qs:
-        # дефолт — просто штат
-        qs = [f"dentist {state}"]
-    all_places: List[Dict[str, Any]] = []
-    for q in qs:
-        all_places.extend(_google_search_one(q))
-    # дедуп по place_id / displayName+address
-    uniq: Dict[str, Dict[str, Any]] = {}
-    for p in all_places:
-        pid = p.get("id") or p.get("name") or p.get("googleMapsUri") or p.get("displayName", {}).get("text")
-        if not pid:
-            continue
-        uniq[pid] = p
-    out = list(uniq.values())
-    log.info("leads:after dedupe -> %d places for %s", len(out), state)
-    return out
+def _build_queries_for_state(state: str) -> List[str]:
+    state = state.upper()
+    queries: List[str] = []
 
+    # 1) общие по штату
+    for tpl in BASE_QUERIES:
+        queries.append(tpl.format(state=state))
 
-def _lead_from_place(p: Dict[str, Any]) -> Dict[str, Any]:
-    name = (p.get("displayName") or {}).get("text") or "No name"
-    website = p.get("websiteUri") or ""
-    phone = p.get("internationalPhoneNumber") or ""
-    # соцсети редко есть в Places, оставляем пустыми
-    return {
-        "name": name,
-        "website": website,
-        "email": "",      # будешь дальше обогащать
-        "facebook": "",
-        "instagram": "",
-        "linkedin": "",
-        "phone": phone,
-    }
+    # 2) по городам, если мы их знаем
+    cities = STATE_CITIES.get(state)
+    if cities:
+        for city in cities:
+            for tpl in CITY_QUERIES:
+                queries.append(tpl.format(city=city, state=state))
+    else:
+        # если городов нет – всё равно не отдаёмся на милость Google одной выдачей
+        extra = [
+            f"family dentist {state}",
+            f"pediatric dentist {state}",
+            f"oral surgery {state}",
+        ]
+        queries.extend(extra)
+
+    return queries
 
 
 def upsert_leads_for_state(state: str) -> Dict[str, int]:
-    list_id = clickup_client.get_or_create_list_for_state(state)
-    places = _places_for_state(state)
+    """
+    1. Строим пачку поисков.
+    2. Тащим по каждому запросу из нового Places.
+    3. Дедупим по place_id / названию.
+    4. Пихаем в ClickUp.
+    """
+    state = state.upper()
+    client = GooglePlacesClient()
 
-    found = len(places)
+    all_places: Dict[str, Dict[str, Any]] = {}  # key -> place dict
+
+    queries = _build_queries_for_state(state)
+    log.info("leads:google (new) queries for %s -> %d queries", state, len(queries))
+
+    for q in queries:
+        places = client.search(q)
+        log.info("leads:google (new) '%s' -> %d places", q, len(places))
+        for p in places:
+            # ключ – либо place_id, либо name+addr
+            pid = p.get("place_id") or f"{p.get('name','').lower()}::{p.get('formatted_address','').lower()}"
+            if pid not in all_places:
+                all_places[pid] = p
+
+    # теперь у нас есть все уникальные
+    places_list = list(all_places.values())
+    log.info("leads:after dedupe -> %d places for %s", len(places_list), state)
+
+    list_id = clickup_client.get_or_create_list_for_state(state)
+
     created = 0
     skipped = 0
-
-    for p in places:
-        lead = _lead_from_place(p)
-        try:
-            ok = clickup_client.upsert_lead(list_id, lead)
-            if ok:
-                created += 1
-            else:
-                skipped += 1
-        except Exception as e:
-            # важно не падать из-за одной плохой задачи
+    for pl in places_list:
+        lead = {
+            "clinic_name": pl.get("name") or "",
+            "address": pl.get("formatted_address") or "",
+            # пока у нас нет откуда взять email / соцсети из Google Places (туда их просто не отдают)
+            # поэтому кладём пустые – но поля в ClickUp мы уже создаём
+            "email": "",
+            "website": pl.get("website") or "",
+            "facebook": "",
+            "instagram": "",
+            "linkedin": "",
+        }
+        ok = clickup_client.upsert_lead(list_id, lead)
+        if ok:
+            created += 1
+        else:
             skipped += 1
-            log.warning("cannot upsert lead %s: %s", lead.get("name"), e)
 
     return {
-        "found": found,
+        "found": len(places_list),
         "created": created,
         "skipped": skipped,
     }
