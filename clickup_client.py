@@ -8,178 +8,125 @@ import requests
 log = logging.getLogger("clickup")
 
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN", "").strip()
-CLICKUP_SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "").strip()
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "").strip()
-CLICKUP_LIST_PREFIX = os.getenv("CLICKUP_LIST_PREFIX", "LEADS-")
+CLICKUP_SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "").strip()
+CLICKUP_TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "").strip()
 
 API_BASE = "https://api.clickup.com/api/v2"
 
-# статусы, которыми уже пользуется код
+# наши статусы
 NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
 INVALID_STATUS = "INVALID"
 REPLIED_STATUS = "REPLIED"
 
-# наши целевые поля
+# наши нужные кастомные поля
 REQUIRED_FIELDS = {
-    "email": {
-        "name": "Email",
-        "type": "text",
-    },
-    "website": {
-        "name": "Website",
-        "type": "text",
-    },
-    "facebook": {
-        "name": "Facebook",
-        "type": "text",
-    },
-    "instagram": {
-        "name": "Instagram",
-        "type": "text",
-    },
-    "linkedin": {
-        "name": "LinkedIn",
-        "type": "text",
-    },
+    "Email": {"type": "short_text"},
+    "Website": {"type": "url"},
+    "Facebook": {"type": "url"},
+    "Instagram": {"type": "url"},
+    "LinkedIn": {"type": "url"},
 }
 
 
-class ClickUpError(RuntimeError):
+class ClickUpError(Exception):
     pass
 
 
 class ClickUpClient:
     def __init__(self, token: str):
-        if not token:
-            raise ClickUpError("CLICKUP_API_TOKEN is empty")
         self.token = token
-        # кэш: list_id -> {field_name_lower: field_id}
-        self._fields_cache: Dict[str, Dict[str, str]] = {}
-
-    # ---------------- low-level ----------------
-    def _headers(self) -> Dict[str, str]:
-        return {
+        self._session = requests.Session()
+        self._session.headers.update({
             "Authorization": self.token,
             "Content-Type": "application/json",
-        }
+        })
 
+    # ---------- low level ----------
     def _get(self, url: str, **kwargs) -> Any:
-        r = requests.get(url, headers=self._headers(), timeout=30, **kwargs)
+        r = self._session.get(url, **kwargs)
         if r.status_code >= 400:
             raise ClickUpError(f"GET {url} -> {r.status_code} {r.text}")
         return r.json()
 
     def _post(self, url: str, json: Any) -> Any:
-        r = requests.post(url, headers=self._headers(), json=json, timeout=30)
+        r = self._session.post(url, json=json)
         if r.status_code >= 400:
             raise ClickUpError(f"POST {url} -> {r.status_code} {r.text}")
         return r.json()
 
-    def _put(self, url: str, json: Any) -> Any:
-        r = requests.put(url, headers=self._headers(), json=json, timeout=30)
-        if r.status_code >= 400:
-            raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
-        return r.json()
-
-    # ---------------- lists ----------------
-    def _list_by_name_in_space(self, space_id: str, name: str) -> Optional[str]:
+    # ---------- lists ----------
+    def _find_list_by_name(self, space_id: str, name: str) -> Optional[str]:
+        # GET /space/{space_id}/list
         url = f"{API_BASE}/space/{space_id}/list"
         data = self._get(url)
-        for lst in data.get("lists", []):
-            if lst.get("name") == name:
-                return lst.get("id")
+        for item in data.get("lists", []):
+            if item.get("name") == name:
+                return item.get("id")
         return None
 
-    def _create_list_in_space(self, space_id: str, name: str) -> str:
+    def _create_list(self, space_id: str, name: str) -> str:
         url = f"{API_BASE}/space/{space_id}/list"
-        payload = {
-            "name": name,
-            "content": "",
-            "statuses": [
-                {"status": NEW_STATUS, "color": "#d3d3d3", "type": "open"},
-                {"status": READY_STATUS, "color": "#6f52ed", "type": "open"},
-                {"status": SENT_STATUS, "color": "#1cc4f7", "type": "open"},
-                {"status": INVALID_STATUS, "color": "#ff5e57", "type": "open"},
-                {"status": REPLIED_STATUS, "color": "#00b894", "type": "closed"},
-            ],
-        }
+        payload = {"name": name}
         data = self._post(url, json=payload)
-        list_id = data.get("id")
-        if not list_id:
-            raise ClickUpError(f"cannot create list in space {space_id}")
-        log.info("created list %s in space %s", list_id, space_id)
-        return list_id
+        return data["id"]
 
     def get_or_create_list_for_state(self, state: str) -> str:
         if not CLICKUP_SPACE_ID:
-            raise ClickUpError("CLICKUP_SPACE_ID is empty")
+            raise ClickUpError("CLICKUP_SPACE_ID is not set")
 
-        list_name = f"{CLICKUP_LIST_PREFIX}{state.upper()}"
-        list_id = self._list_by_name_in_space(CLICKUP_SPACE_ID, list_name)
-        if not list_id:
-            list_id = self._create_list_in_space(CLICKUP_SPACE_ID, list_name)
+        list_name = f"LEADS-{state}"
+        existing = self._find_list_by_name(CLICKUP_SPACE_ID, list_name)
+        if existing:
+            # убедимся, что на нём есть нужные поля
+            self._ensure_required_fields(existing)
+            return existing
 
-        # ВАЖНО: пробуем добавить поля, но НЕ падаем, если ClickUp не дал
-        self._ensure_required_fields(list_id)
-        return list_id
+        # если хотим — можем копировать из шаблона, но это опционально
+        new_list_id = self._create_list(CLICKUP_SPACE_ID, list_name)
+        self._ensure_required_fields(new_list_id)
+        return new_list_id
 
-    # ---------------- custom fields ----------------
-    def _fetch_list_fields(self, list_id: str) -> List[Dict[str, Any]]:
+    # ---------- custom fields ----------
+    def _list_custom_fields(self, list_id: str) -> List[Dict[str, Any]]:
         url = f"{API_BASE}/list/{list_id}/field"
         data = self._get(url)
         return data.get("fields", [])
 
-    def _create_field_on_list(self, list_id: str, name: str, ftype: str = "text") -> Optional[str]:
+    def _create_field_on_list(self, list_id: str, name: str, field_type: str) -> Optional[str]:
         """
-        Пытаемся создать поле. Если ClickUp не даёт (план, права и т.п.) — просто логируем и возвращаем None.
+        Создаём поле. Если ClickUp вернул 4xx — просто предупреждаем и не падаем.
         """
         url = f"{API_BASE}/list/{list_id}/field"
-        payload = {"name": name, "type": ftype}
-        r = requests.post(url, headers=self._headers(), json=payload, timeout=30)
+        payload = {
+            "name": name,
+            "type": field_type,
+        }
+        r = self._session.post(url, json=payload)
         if r.status_code >= 400:
-            log.warning("cannot create field %s on list %s -> %s %s", name, list_id, r.status_code, r.text[:200])
-            return None
-        data = r.json()
-        fid = data.get("id")
-        if not fid:
             log.warning("cannot create field %s on list %s (no id in resp)", name, list_id)
             return None
-        log.info("created custom field %s (%s) on list %s", fid, name, list_id)
-        return fid
+        data = r.json()
+        return data.get("id")
 
     def _ensure_required_fields(self, list_id: str) -> Dict[str, str]:
         """
-        Гарантируем максимум из того, что нам позволит ClickUp.
-        Даже если ни одно поле создать не удалось — НЕ падаем.
+        Убеждаемся, что на листе есть наши поля. Возвращаем map: имя -> field_id
         """
-        if list_id in self._fields_cache:
-            return self._fields_cache[list_id]
+        existing = self._list_custom_fields(list_id)
+        name_to_id = {f.get("name"): f.get("id") for f in existing if f.get("id")}
 
-        existing = self._fetch_list_fields(list_id)
-        by_name_lower: Dict[str, str] = {}
-        for f in existing:
-            nm = (f.get("name") or "").strip().lower()
-            if nm:
-                by_name_lower[nm] = f.get("id")
+        for fname, cfg in REQUIRED_FIELDS.items():
+            if fname in name_to_id:
+                continue
+            fid = self._create_field_on_list(list_id, fname, cfg["type"])
+            if fid:
+                name_to_id[fname] = fid
+        return name_to_id
 
-        # пробуем создать недостающие
-        for _, cfg in REQUIRED_FIELDS.items():
-            field_name = cfg["name"]
-            low = field_name.lower()
-            if low not in by_name_lower:
-                fid = self._create_field_on_list(list_id, field_name, cfg["type"])
-                if fid:
-                    by_name_lower[low] = fid
-                else:
-                    # не смогли создать — просто живём дальше
-                    pass
-
-        self._fields_cache[list_id] = by_name_lower
-        return by_name_lower
-
-    # ---------------- tasks ----------------
+    # ---------- tasks ----------
     def create_task(
         self,
         list_id: str,
@@ -194,117 +141,88 @@ class ClickUpClient:
         }
 
         if custom_fields:
-            cf_items = []
-            for fid, val in custom_fields.items():
-                if not fid:
-                    continue
-                if val is None or val == "":
-                    continue
-                cf_items.append({"id": fid, "value": val})
-            if cf_items:
-                payload["custom_fields"] = cf_items
+            # ClickUp ждёт массив с id/ value
+            payload["custom_fields"] = [
+                {"id": fid, "value": val} for fid, val in custom_fields.items() if val is not None
+            ]
 
-        data = self._post(url, json=payload)
-        tid = data.get("id")
-        if not tid:
-            raise ClickUpError(f"cannot create task on list {list_id}")
-        return tid
+        r = self._session.post(url, json=payload)
+        if r.status_code == 400 and "Custom field usages exceeded" in r.text:
+            # повторяем без custom_fields
+            log.warning("ClickUp custom field limit reached on list %s -> creating task without custom fields", list_id)
+            payload.pop("custom_fields", None)
+            r = self._session.post(url, json=payload)
 
-    def move_lead_to_status(self, task_id: str, status: str) -> None:
+        if r.status_code >= 400:
+            raise ClickUpError(f"POST {url} -> {r.status_code} {r.text}")
+
+        data = r.json()
+        return data["id"]
+
+    def update_task_custom_fields(self, task_id: str, custom_fields: Dict[str, Any]) -> None:
+        """
+        Обновляет кастомные поля уже созданной задачи.
+        Если снова упираемся в лимит — просто предупреждаем.
+        """
         url = f"{API_BASE}/task/{task_id}"
-        self._put(url, json={"status": status})
-        log.info("task %s moved to %s", task_id, status)
-
-    def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        page = 0
-        while True:
-            url = f"{API_BASE}/list/{list_id}/task?subtasks=true&page={page}"
-            data = self._get(url)
-            tasks = data.get("tasks", [])
-            if not tasks:
-                break
-            for t in tasks:
-                out.append(
-                    {
-                        "task_id": t.get("id"),
-                        "name": t.get("name"),
-                        "status": t.get("status", {}).get("status") or t.get("status"),
-                        "custom_fields": t.get("custom_fields", []),
-                    }
-                )
-            page += 1
-        return out
-
-    # ---------------- search by email (for /replies) ----------------
-    def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
-        if not CLICKUP_SPACE_ID:
-            return None
-
-        email_addr_low = (email_addr or "").strip().lower()
-        if not email_addr_low:
-            return None
-
-        # получаем все листы в space
-        url = f"{API_BASE}/space/{CLICKUP_SPACE_ID}/list"
-        data = self._get(url)
-        lists = data.get("lists", [])
-
-        for lst in lists:
-            lid = lst.get("id")
-            if not lid:
-                continue
-            fields_map = self._ensure_required_fields(lid)
-            email_field_id = fields_map.get("email") or fields_map.get("email".lower())
-            tasks = self.get_leads_from_list(lid)
-            for t in tasks:
-                for cf in t.get("custom_fields", []):
-                    if cf.get("id") == email_field_id:
-                        val = (cf.get("value") or "").strip().lower()
-                        if val == email_addr_low:
-                            return {
-                                "task_id": t["task_id"],
-                                "clinic_name": t["name"],
-                            }
-        return None
-
-    # ---------------- upsert used by leads.py ----------------
-    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> str:
-        """
-        lead: {
-          "name": ...,
-          "email": ...,
-          "website": ...,
-          "facebook": ...,
-          "instagram": ...,
-          "linkedin": ...,
+        payload = {
+            "custom_fields": [
+                {"id": fid, "value": val} for fid, val in custom_fields.items() if val is not None
+            ]
         }
-        Всегда создаём новую задачу со статусом NEW.
-        """
-        name = lead.get("name") or "Unknown clinic"
-        fields_map = self._ensure_required_fields(list_id)
+        r = self._session.put(url, json=payload)
+        if r.status_code == 400 and "Custom field usages exceeded" in r.text:
+            log.warning("cannot update custom fields for task %s (limit reached)", task_id)
+            return
+        if r.status_code >= 400:
+            raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
 
-        cf_values: Dict[str, Any] = {}
-        for logical_key, cfg in REQUIRED_FIELDS.items():
-            val = lead.get(logical_key)
-            if not val:
-                continue
-            field_id = fields_map.get(cfg["name"].lower())
-            if field_id:
-                cf_values[field_id] = val
-            else:
-                # поле не получилось создать — просто пропускаем
-                pass
+    # ---------- business ----------
+    def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
+        url = f"{API_BASE}/list/{list_id}/task"
+        data = self._get(url)
+        return data.get("tasks", [])
+
+    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> None:
+        """
+        Простейший вариант: сейчас просто создаём всегда.
+        Можно сделать поиск по имени/сайту и обновлять, если надо.
+        """
+        name = lead["name"]
+        # гарантируем поля (могут не создаться, если у плана лимит — мы это переживём)
+        field_map = self._ensure_required_fields(list_id)
+
+        custom_values: Dict[str, Any] = {}
+        if field_map.get("Email"):
+            custom_values[field_map["Email"]] = lead.get("email") or ""
+        if field_map.get("Website"):
+            custom_values[field_map["Website"]] = lead.get("website") or ""
+        if field_map.get("Facebook"):
+            custom_values[field_map["Facebook"]] = lead.get("facebook") or ""
+        if field_map.get("Instagram"):
+            custom_values[field_map["Instagram"]] = lead.get("instagram") or ""
+        if field_map.get("LinkedIn"):
+            custom_values[field_map["LinkedIn"]] = lead.get("linkedin") or ""
 
         task_id = self.create_task(
             list_id=list_id,
             name=name,
             status=NEW_STATUS,
-            custom_fields=cf_values,
+            custom_fields=custom_values,
         )
         log.info("created lead task %s on list %s (%s)", task_id, list_id, name)
-        return task_id
+
+    # вспомогательные, которые уже были у тебя
+    def move_lead_to_status(self, task_id: str, status: str) -> None:
+        url = f"{API_BASE}/task/{task_id}"
+        payload = {"status": status}
+        r = self._session.put(url, json=payload)
+        if r.status_code >= 400:
+            raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
+
+    def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
+        # можно будет дописать позже
+        return None
 
 
-# singleton
 clickup_client = ClickUpClient(CLICKUP_API_TOKEN)
