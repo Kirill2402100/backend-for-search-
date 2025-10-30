@@ -73,7 +73,7 @@ class ClickUpClient:
 
     def _set_pipeline_like_ny(self, list_id: str) -> None:
         """
-        Если лист создавался НЕ из шаблона — навешиваем свои статусы.
+        Даже если лист создавался из шаблона — навешиваем свои статусы.
         Делаем 5 штук: NEW, READY, SENT, REPLIED, INVALID.
         """
         url = f"{CLICKUP_BASE}/list/{list_id}/field"
@@ -115,6 +115,7 @@ class ClickUpClient:
             self._post(url, payload)
             log.info("clickup:set pipeline for list %s", list_id)
         except ClickUpError as e:
+            # бывает, что у ClickUp на списке стоят “зафиксированные” статусы — тогда просто логируем
             log.warning("clickup:cannot set pipeline on list %s: %s", list_id, e)
 
     def _list_custom_fields(self, list_id: str) -> Dict[str, str]:
@@ -129,6 +130,10 @@ class ClickUpClient:
         return out
 
     def _create_field_on_list(self, list_id: str, name: str, ftype: str) -> Optional[str]:
+        """
+        Создаём кастомное поле. Если ClickUp не вернул id (как в твоём логе),
+        пробуем перечитать список полей и взять по имени.
+        """
         url = f"{CLICKUP_BASE}/list/{list_id}/field"
         payload = {
             "type": ftype,
@@ -144,8 +149,12 @@ class ClickUpClient:
 
         fid = resp.get("id")
         if not fid:
-            log.warning("clickup:cannot create field %s on list %s (no id in resp)", name, list_id)
-            return None
+            # иногда API вернул 200, но без id — перечитаем поля и возьмём свежий
+            fields_after = self._list_custom_fields(list_id)
+            fid = fields_after.get(name)
+            if not fid:
+                log.warning("clickup:cannot create field %s on list %s (no id in resp)", name, list_id)
+                return None
         return fid
 
     def _ensure_required_fields(self, list_id: str) -> Dict[str, Optional[str]]:
@@ -188,6 +197,10 @@ class ClickUpClient:
                 CLICKUP_TEMPLATE_LIST_ID,
                 target_name,
             )
+
+            # 👇 добавили: ClickUp может НЕ перенести статусы из шаблона
+            self._set_pipeline_like_ny(new_id)
+
             # на всякий случай убедимся, что поля есть
             self._ensure_required_fields(new_id)
             return new_id
