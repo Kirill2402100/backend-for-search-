@@ -1,41 +1,37 @@
-import os
+# config.py
 from pydantic_settings import BaseSettings
-from pydantic import Field
+
 
 class Settings(BaseSettings):
-    CLICKUP_API_TOKEN: str = Field(default="")
-    CLICKUP_SPACE_ID: str = Field(default="")
-    CLICKUP_TEAM_ID: str = Field(default="")
+    # --- ClickUp ---
+    CLICKUP_API_TOKEN: str = ""
+    CLICKUP_TEAM_ID: str = ""
+    CLICKUP_SPACE_ID: str = ""
 
-    SMTP_FROM: str = Field(default="")
-    SMTP_HOST: str = Field(default="")
-    SMTP_USERNAME: str = Field(default="")
-    SMTP_PASSWORD: str = Field(default="")
-    SMTP_PORT: int = Field(default=465)
+    # --- Telegram ---
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""          # можно пусто — тогда бот отвечает всем
+    TELEGRAM_POLLING: str = "0"         # "1" => включить long polling
+    TELEGRAM_POLLING_INTERVAL: int = 2  # сек между запросами, если вдруг ошибка
 
-    EMAIL_VALIDATION_PROVIDER: str = Field(default="verifalia")
-    EMAIL_VALIDATION_API_KEY: str = Field(default="")
+    # --- SMTP / почта ---
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""
 
-    TELEGRAM_BOT_TOKEN: str = Field(default="")
-    TELEGRAM_CHAT_ID: str = Field(default="")
+    # --- валидация email ---
+    EMAIL_VALIDATION_PROVIDER: str = ""  # например, "abstractapi"
+    EMAIL_VALIDATION_API_KEY: str = ""
+
+    # --- Google / сбор клиник ---
+    # ВАЖНО: это поле нужно, чтобы leads.py увидел ключ
+    GOOGLE_PLACES_API_KEY: str = ""
 
     class Config:
-        case_sensitive = True
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
-settings = Settings(
-    CLICKUP_API_TOKEN=os.getenv("CLICKUP_API_TOKEN", ""),
-    CLICKUP_SPACE_ID=os.getenv("CLICKUP_SPACE_ID", ""),
-    CLICKUP_TEAM_ID=os.getenv("CLICKUP_TEAM_ID", ""),
 
-    SMTP_FROM=os.getenv("SMTP_FROM", ""),
-    SMTP_HOST=os.getenv("SMTP_HOST", ""),
-    SMTP_USERNAME=os.getenv("SMTP_USERNAME", ""),
-    SMTP_PASSWORD=os.getenv("SMTP_PASSWORD", ""),
-    SMTP_PORT=int(os.getenv("SMTP_PORT", "465")),
-
-    EMAIL_VALIDATION_PROVIDER=os.getenv("EMAIL_VALIDATION_PROVIDER", "verifalia"),
-    EMAIL_VALIDATION_API_KEY=os.getenv("EMAIL_VALIDATION_API_KEY", ""),
-
-    TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-    TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID", ""),
-)
+settings = Settings()
