@@ -8,23 +8,20 @@ import requests
 log = logging.getLogger("clickup")
 logging.basicConfig(level=logging.INFO)
 
+# ===== ENV =====
+CLICKUP_TOKEN = os.getenv("CLICKUP_API_TOKEN", "").strip()
+SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "").strip()
+TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "").strip()  # сейчас почти не используем, но пусть будет
+TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "").strip()
+
 BASE_URL = "https://api.clickup.com/api/v2"
 
-CLICKUP_TOKEN = os.getenv("CLICKUP_API_TOKEN", "")
-SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "")
-TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
-# Лист-эталон (у тебя это был NY)
-TEMPLATE_LIST_ID = (os.getenv("CLICKUP_TEMPLATE_LIST_ID", "") or "").strip()
-
-# наши статусы
+# ===== OUR STATUSES (как в твоём NY-листе) =====
 NEW_STATUS = "NEW"
 READY_STATUS = "READY"
 SENT_STATUS = "SENT"
 INVALID_STATUS = "INVALID"
-REPLIED_STATUS = "REPLIED"
-
-# если вдруг в ответе 400 "custom field usages exceeded" – просто запомним и не будем долбиться дальше
-CF_HARD_FAILED: Dict[str, bool] = {}
+REPLIED_STATUS = "REPLIED"   # <- ЭТО ВАЖНО, чтобы telegram_bot не падал
 
 
 def _headers() -> Dict[str, str]:
@@ -39,13 +36,29 @@ class ClickUpError(Exception):
 
 
 class ClickUpClient:
+    """
+    Здесь:
+    - создаём лист LEADS-<STATE> в указанном SPACE
+    - если задан TEMPLATE_LIST_ID — копируем ИЗ НЕГО СТАТУСЫ
+    - потом в любом случае создаём наши 5 полей EN: Email, Website, Facebook, Instagram, LinkedIn
+    - создаём/читаем задачи
+    """
+
+    # -------------------------------------------------
+    # INIT
+    # -------------------------------------------------
     def __init__(self, space_id: str, team_id: str):
+        if not CLICKUP_TOKEN:
+            raise RuntimeError("CLICKUP_API_TOKEN is empty")
+        if not space_id:
+            raise RuntimeError("CLICKUP_SPACE_ID is empty")
+
         self.space_id = space_id
         self.team_id = team_id
 
-    # --------------------------------
-    # low-level
-    # --------------------------------
+    # -------------------------------------------------
+    # LOW LEVEL
+    # -------------------------------------------------
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
         r = requests.get(url, headers=_headers(), params=params, timeout=15)
         if r.status_code >= 400:
@@ -64,228 +77,183 @@ class ClickUpClient:
             raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
         return r.json()
 
-    # --------------------------------
-    # lists
-    # --------------------------------
+    # -------------------------------------------------
+    # LISTS
+    # -------------------------------------------------
     def get_or_create_list_for_state(self, state: str) -> str:
         """
-        В НОВОМ space (который ты укажешь в CLICKUP_SPACE_ID) создаём LEADS-<STATE>.
-        Если есть — используем.
-        После создания пытаемся:
-         1) скопировать из TEMPLATE_LIST_ID
-         2) если не вышло — заливаем наши английские статусы и 5 англ. полей
+        Ищем лист LEADS-<STATE> в текущем SPACE.
+        Если нет — создаём.
+        1) создаём пустой лист
+        2) если есть TEMPLATE_LIST_ID -> копируем из него СТАТУСЫ
+        3) создаём наши 5 полей (EN)
         """
         wanted_name = f"LEADS-{state}"
 
-        lists_url = f"{BASE_URL}/space/{self.space_id}/list"
-        data = self._get(lists_url)
+        # 1. поиск
+        space_lists_url = f"{BASE_URL}/space/{self.space_id}/list"
+        try:
+            data = self._get(space_lists_url)
+            for item in data.get("lists", []):
+                if item.get("name") == wanted_name:
+                    list_id = str(item["id"])
+                    # на всякий случай убедимся, что нужные поля есть
+                    self._ensure_standard_fields(list_id)
+                    return list_id
+        except Exception as e:
+            log.warning("clickup: cannot list lists in space %s: %s", self.space_id, e)
 
-        for item in data.get("lists", []):
-            if item.get("name") == wanted_name:
-                return str(item["id"])
-
-        # нет — создаём
-        created = self._post(lists_url, {"name": wanted_name})
+        # 2. создание
+        create_url = f"{BASE_URL}/space/{self.space_id}/list"
+        payload = {"name": wanted_name}
+        created = self._post(create_url, payload)
         list_id = str(created["id"])
         log.info("clickup: created list %s (%s)", wanted_name, list_id)
 
-        # инициализация листа
-        self._init_list_from_template_or_default(list_id)
+        # 3. если есть шаблон — копируем СТАТУСЫ только
+        if TEMPLATE_LIST_ID:
+            log.info(
+                "clickup: will copy statuses & fields from template %s -> %s",
+                TEMPLATE_LIST_ID,
+                list_id,
+            )
+            self._copy_statuses_from_template(list_id, TEMPLATE_LIST_ID)
+        else:
+            log.warning("clickup: CLICKUP_TEMPLATE_LIST_ID is empty -> using default board statuses")
+
+        # 4. наши 5 полей
+        self._ensure_standard_fields(list_id)
 
         return list_id
 
-    def _init_list_from_template_or_default(self, list_id: str) -> None:
-        # 1. пробуем скопировать из шаблона (твой NY)
-        if TEMPLATE_LIST_ID:
-            try:
-                log.info(
-                    "clickup: will copy statuses & fields from template %s -> %s",
-                    TEMPLATE_LIST_ID,
-                    list_id,
-                )
-                self._copy_fields_and_statuses_from_template(list_id, TEMPLATE_LIST_ID)
+    # -------------------------------------------------
+    # TEMPLATE COPY (only statuses)
+    # -------------------------------------------------
+    def _copy_statuses_from_template(self, target_list_id: str, template_list_id: str) -> None:
+        """
+        Копируем ТОЛЬКО статусы с шаблона.
+        Поля не копируем специально — у шаблона они русские.
+        """
+        try:
+            t_info = self._get(f"{BASE_URL}/list/{template_list_id}")
+            statuses = t_info.get("statuses") or []
+            if not statuses:
+                log.warning("clickup: template %s has no statuses", template_list_id)
                 return
-            except Exception as e:
-                log.warning("clickup: copy from template failed: %s", e)
 
-        # 2. если не вышло — ставим наши статусы и поля
-        log.warning(
-            "clickup: using default statuses/fields for list %s (template missing or failed)",
-            list_id,
-        )
-        self._apply_default_statuses(list_id)
-        self._ensure_eng_custom_fields(list_id)
-
-    def _copy_fields_and_statuses_from_template(self, target_list_id: str, template_list_id: str) -> None:
-        # поля
-        t_fields = self._list_raw_custom_fields(template_list_id)
-        for f in t_fields:
-            self._ensure_custom_field(target_list_id, f)
-
-        # статусы
-        t_def = self._get(f"{BASE_URL}/list/{template_list_id}")
-        statuses = t_def.get("statuses") or []
-        if statuses:
-            self._put(f"{BASE_URL}/list/{target_list_id}", {"statuses": statuses})
-        else:
-            # если шаблон был пустой по статусам — наш дефолт
-            self._apply_default_statuses(target_list_id)
-
-    def _apply_default_statuses(self, list_id: str) -> None:
-        """
-        Прописать листу наши 5 английских статусов.
-        """
-        payload = {
-            "statuses": [
-                {"status": NEW_STATUS, "orderindex": 0, "color": "#6f6f6f"},
-                {"status": READY_STATUS, "orderindex": 1, "color": "#956fff"},
-                {"status": SENT_STATUS, "orderindex": 2, "color": "#2f97ff"},
-                {"status": INVALID_STATUS, "orderindex": 3, "color": "#ff5f5f"},
-                {"status": REPLIED_STATUS, "orderindex": 4, "color": "#29b47d"},
-            ]
-        }
-        try:
-            self._put(f"{BASE_URL}/list/{list_id}", payload)
-            log.info("clickup: applied default statuses to list %s", list_id)
+            # важно: тут мы реально заменяем статусы на листе
+            self._put(
+                f"{BASE_URL}/list/{target_list_id}",
+                {"statuses": statuses},
+            )
+            log.info("clickup: statuses copied from %s to %s", template_list_id, target_list_id)
         except Exception as e:
-            log.warning("clickup: cannot apply default statuses to %s: %s", list_id, e)
+            log.warning("clickup: copy statuses failed: %s", e)
 
-    # --------------------------------
-    # fields
-    # --------------------------------
+    # -------------------------------------------------
+    # CUSTOM FIELDS
+    # -------------------------------------------------
+    STANDARD_FIELDS = [
+        ("Email", "text"),
+        ("Website", "text"),
+        ("Facebook", "text"),
+        ("Instagram", "text"),
+        ("LinkedIn", "text"),
+    ]
+
     def _list_raw_custom_fields(self, list_id: str) -> List[Dict[str, Any]]:
-        url = f"{BASE_URL}/list/{list_id}/field"
-        data = self._get(url)
-        return data if isinstance(data, list) else []
-
-    def _ensure_custom_field(self, list_id: str, field_def: Dict[str, Any]) -> None:
-        # best effort
-        if CF_HARD_FAILED.get(list_id):
-            return
         try:
-            payload = {
-                "name": field_def.get("name"),
-                "type": field_def.get("type"),
-            }
-            resp = self._post(f"{BASE_URL}/list/{list_id}/field", payload)
-            if not resp or not resp.get("id"):
-                log.warning("clickup: cannot create field %s on list %s (no id in resp)", payload["name"], list_id)
-        except ClickUpError as e:
-            # лимит — запомним
-            if "Custom field usages exceeded" in str(e):
-                CF_HARD_FAILED[list_id] = True
-            log.warning("clickup: cannot create field on %s: %s", list_id, e)
+            data = self._get(f"{BASE_URL}/list/{list_id}/field")
+            return data if isinstance(data, list) else []
         except Exception as e:
-            log.warning("clickup: cannot create field on %s: %s", list_id, e)
+            log.warning("clickup: cannot read fields from list %s: %s", list_id, e)
+            return []
 
-    def _ensure_eng_custom_fields(self, list_id: str) -> None:
-        wanted = [
-            ("Email", 1),
-            ("Website", 1),
-            ("Facebook", 1),
-            ("Instagram", 1),
-            ("LinkedIn", 1),
-        ]
-        existing = {f.get("name") for f in self._list_raw_custom_fields(list_id)}
-        for name, ftype in wanted:
-            if name in existing:
+    def _create_custom_field(self, list_id: str, name: str, ftype: str = "text") -> Optional[str]:
+        """
+        Создаём одно поле. Если тариф не даёт — просто лог и None.
+        """
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/list/{list_id}/field",
+                headers=_headers(),
+                json={"name": name, "type": ftype},
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                # тут как раз твоя ошибка: {"err":"Custom field usages exceeded for your plan","ECODE":"FIELD_033"}
+                log.warning(
+                    "clickup: cannot create field %s on list %s (%s): %s",
+                    name,
+                    list_id,
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return None
+            j = resp.json()
+            fid = str(j.get("id") or "")
+            return fid or None
+        except Exception as e:
+            log.warning("clickup: exception when creating field %s on %s: %s", name, list_id, e)
+            return None
+
+    def _ensure_standard_fields(self, list_id: str) -> None:
+        """
+        Проверяем, что на листе есть наши 5 английских полей.
+        Если чего-то нет — создаём.
+        """
+        existing = {f.get("name"): f.get("id") for f in self._list_raw_custom_fields(list_id)}
+        for fname, ftype in self.STANDARD_FIELDS:
+            if fname in existing:
                 continue
-            self._ensure_custom_field(list_id, {"name": name, "type": ftype})
+            self._create_custom_field(list_id, fname, ftype)
 
-    def _list_custom_fields_map(self, list_id: str) -> Dict[str, str]:
-        res: Dict[str, str] = {}
+    def _custom_fields_map(self, list_id: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
         for f in self._list_raw_custom_fields(list_id):
-            fid = str(f.get("id") or "")
-            name = f.get("name") or ""
-            if fid and name:
-                res[name] = fid
-        return res
+            name = f.get("name")
+            fid = f.get("id")
+            if name and fid:
+                out[name] = str(fid)
+        return out
 
-    # --------------------------------
-    # tasks
-    # --------------------------------
+    # -------------------------------------------------
+    # TASKS
+    # -------------------------------------------------
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
+        """
+        Забираем все задачи из листа (с пагинацией).
+        """
         url = f"{BASE_URL}/list/{list_id}/task"
-        page = 0
+        params = {"page": 0}
         out: List[Dict[str, Any]] = []
+
         while True:
-            data = self._get(url, params={"page": page, "subtasks": "true"})
-            tasks = data.get("tasks", [])
+            data = self._get(url, params=params)
+            tasks = data.get("tasks") or []
             out.extend(tasks)
             if len(tasks) < 100:
                 break
-            page += 1
+            params["page"] += 1
+
         return out
 
-    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> None:
-        # главное – имя
-        name = (
-            lead.get("name")
-            or lead.get("title")
-            or lead.get("clinic_name")
-            or lead.get("business_name")
-            or "Clinic"
-        )
-
-        # пытаемся создать со статусом NEW
-        payload = {
-            "name": name,
-            "status": NEW_STATUS,
-        }
-
-        try:
-            created = self._post(f"{BASE_URL}/list/{list_id}/task", payload)
-        except ClickUpError as e:
-            # если у листа опять “Status not found” – попробуем без статуса
-            if "Status not found" in str(e):
-                created = self._post(f"{BASE_URL}/list/{list_id}/task", {"name": name})
-            else:
-                raise
-
-        task_id = str(created["id"])
-
-        # если у нас есть карта полей – проставим
-        field_map = self._list_custom_fields_map(list_id)
-
-        def _set_cf(fname: str, value: Any) -> None:
-            if not value:
-                return
-            fid = field_map.get(fname)
-            if not fid:
-                return
-            try:
-                self._put(f"{BASE_URL}/task/{task_id}/field/{fid}", {"value": value})
-            except Exception as e:
-                log.warning("clickup: cannot set field %s on task %s: %s", fname, task_id, e)
-
-        _set_cf("Email", lead.get("email"))
-        _set_cf("Website", lead.get("website"))
-        _set_cf("Facebook", lead.get("facebook"))
-        _set_cf("Instagram", lead.get("instagram"))
-        _set_cf("LinkedIn", lead.get("linkedin"))
-
-    # --------------------------------
-    # replies (нужно твоему боту)
-    # --------------------------------
     def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
-        # берём все листы в space и ищем
-        url = f"{BASE_URL}/space/{self.space_id}/list"
-        data = self._get(url)
+        """
+        Для обработки /replies — ищем задачу по Email.
+        Ищем по ВСЕМ нашим LEADS-* листам в текущем SPACE.
+        """
+        space_lists_url = f"{BASE_URL}/space/{self.space_id}/list"
+        data = self._get(space_lists_url)
+
         for item in data.get("lists", []):
             list_id = str(item["id"])
             tasks = self.get_leads_from_list(list_id)
-            field_map = self._list_custom_fields_map(list_id)
-            email_field_id = None
-            # ищем id поля Email
-            for name, fid in field_map.items():
-                if name.lower() == "email":
-                    email_field_id = fid
-                    break
             for t in tasks:
-                for cf in t.get("custom_fields") or []:
-                    if email_field_id and cf.get("id") == email_field_id:
+                for cf in (t.get("custom_fields") or []):
+                    if cf.get("name") == "Email":
                         val = cf.get("value") or ""
-                        if val.lower() == email_addr.lower():
+                        if val and val.lower() == email_addr.lower():
                             return {
                                 "task_id": t["id"],
                                 "clinic_name": t.get("name") or "",
@@ -293,10 +261,60 @@ class ClickUpClient:
         return None
 
     def move_lead_to_status(self, task_id: str, status: str) -> None:
-        try:
-            self._put(f"{BASE_URL}/task/{task_id}", {"status": status})
-        except Exception as e:
-            log.warning("clickup: cannot move task %s to %s: %s", task_id, status, e)
+        self._put(f"{BASE_URL}/task/{task_id}", {"status": status})
+
+    def upsert_lead(self, list_id: str, lead: Dict[str, Any]) -> None:
+        """
+        Сейчас делаем просто: всегда создаём новую задачу.
+        """
+        # нормальное имя
+        name = (
+            lead.get("name")
+            or lead.get("title")
+            or lead.get("business_name")
+            or "Clinic"
+        )
+
+        # по умолчанию в NEW
+        status = lead.get("status") or NEW_STATUS
+
+        # создаём таску
+        created = self._post(
+            f"{BASE_URL}/list/{list_id}/task",
+            {
+                "name": name,
+                "status": status,
+            },
+        )
+        task_id = created["id"]
+
+        # ставим кастомки
+        cf_map = self._custom_fields_map(list_id)
+
+        def _set_cf(field_name: str, value: Any) -> None:
+            fid = cf_map.get(field_name)
+            if not fid:
+                return
+            self._put(
+                f"{BASE_URL}/task/{task_id}/field/{fid}",
+                {"value": value},
+            )
+
+        if lead.get("email"):
+            _set_cf("Email", lead["email"])
+        if lead.get("website"):
+            _set_cf("Website", lead["website"])
+        if lead.get("facebook"):
+            _set_cf("Facebook", lead["facebook"])
+        if lead.get("instagram"):
+            _set_cf("Instagram", lead["instagram"])
+        if lead.get("linkedin"):
+            _set_cf("LinkedIn", lead["linkedin"])
+
+        # если вдруг ты захочешь класть address/source – можно добавить сюда же
+        # но сейчас ты просил только эти 5
+        log.info("clickup: created lead task %s on list %s (%s)", task_id, list_id, name)
 
 
+# singleton
 clickup_client = ClickUpClient(space_id=SPACE_ID, team_id=TEAM_ID)
