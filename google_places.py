@@ -42,15 +42,25 @@ class GooglePlacesClient:
         # id = (старый place_id), displayName = (старое name)
         field_mask = "places.id,places.displayName,places.formattedAddress,places.websiteUri"
 
-        # Новый API требует POST-запрос с JSON-телом
+        # 1. Тело запроса (БЕЗ fieldMask)
         payload = {
             "textQuery": query,
             "maxResultCount": 20,  # Это максимум для searchText
-            "fieldMask": field_mask
+        }
+        
+        # 2. Маска полей передается как HTTP-заголовок
+        headers = {
+            "X-Goog-FieldMask": field_mask
         }
 
         try:
-            r = self.session.post(BASE_URL, json=payload, timeout=15)
+            # 3. Передаем и payload (json), и headers
+            r = self.session.post(
+                BASE_URL, 
+                json=payload, 
+                headers=headers,  # <-- ВОТ ИСПРАВЛЕНИЕ
+                timeout=15
+            )
             # Проверка на 4xx/5xx ошибки
             r.raise_for_status()
             
@@ -59,11 +69,13 @@ class GooglePlacesClient:
             return data.get("places", [])
 
         except requests.exceptions.HTTPError as e:
+            # Логируем ошибку, чтобы было понятнее
+            err_text = e.response.text[:500] # Ограничим длину, чтобы не забить логи
             log.error(
                 "Google Places (New) HTTP error for query '%s': %s - %s",
-                query, e.response.status_code, e.response.text
+                query, e.response.status_code, err_text
             )
-            if "has not been used" in e.response.text or "API_NOT_ACTIVATED" in e.response.text:
+            if "has not been used" in err_text or "API_NOT_ACTIVATED" in err_text:
                  log.error(
                      "!!! КРИТИЧНО: 'Places API (New)' не включен в Google Cloud Console. "
                      "Нужно зайти и включить именно 'Places API (New)'."
@@ -80,7 +92,9 @@ class GooglePlacesClient:
         places: List[Dict[str, Any]] = []
         for item in raw_places:
             # 'name' теперь в 'displayName'
-            name = (item.get("displayName") or {}).get("text", "")
+            name_data = item.get("displayName")
+            name = name_data.get("text") if isinstance(name_data, dict) else str(name_data)
+
             # 'place_id' теперь 'id'
             place_id = item.get("id")
             # 'formatted_address' теперь 'formattedAddress'
