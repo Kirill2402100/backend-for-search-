@@ -94,8 +94,18 @@ def upsert_leads_for_state(state: str) -> Dict[str, int]:
                 "source": p.get("source") or "google",
                 "status": "NEW",
             }
-            clickup_client.upsert_lead(list_id, lead)
-            created += 1
+            
+            # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ СЧЕТЧИКА 🟢 =====
+            # upsert_lead вернет True (если создал) или False (если пропустил дубликат)
+            was_created = clickup_client.upsert_lead(list_id, lead)
+            
+            if was_created:
+                created += 1
+            else:
+                # Считаем пропущенные дубликаты как 'skipped'
+                skipped += 1
+            # ===== 🟢 КОНЕЦ ИСПРАВЛЕНИЯ 🟢 =====
+
         except Exception as e:
             log.warning("leads: cannot upsert %s: %s", p.get("name"), e)
             skipped += 1
