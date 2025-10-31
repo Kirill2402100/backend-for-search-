@@ -16,7 +16,6 @@ from clickup_client import (
 from telegram_notifier import send_message as tg_send
 from send import run_send # <-- Импортируем новый run_send
 from leads import upsert_leads_for_state
-from utils import _task_status_str # <-- 🟢 ИСПРАВЛЕНИЕ
 
 log = logging.getLogger("telegram_bot")
 TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -54,9 +53,18 @@ def _parse_cmd(text: str) -> List[str]:
     parts = text.strip().split()
     return [p.strip() for p in parts if p.strip()]
 
-#
-# 🟢 Функция _task_status_str УДАЛЕНА ОТСЮДА и перенесена в utils.py 🟢
-#
+
+def _task_status_str(task: Dict[str, Any]) -> str:
+    """
+    ClickUp иногда возвращает 'status': 'open', а иногда 'status': {'status': 'open', ...}
+    """
+    st = task.get("status")
+    if isinstance(st, str):
+        return st
+    if isinstance(st, dict):
+        return st.get("status") or st.get("value") or ""
+    return ""
+
 
 def _stats_for_state(state: str) -> str:
     try:
@@ -91,7 +99,7 @@ def _stats_for_state(state: str) -> str:
     return (
         f"<b>Статистика {state}</b>\n"
         f"Всего в листе: {total}\n"
-        f"---\n"
+        f"---\n"  # <-- 🟢 ИСПРАВЛЕНИЕ 1
         f"В подготовке (NEW): {new_cnt}\n"
         f"Готовы к отправке (READY): {ready_cnt}\n"
         f"---\n"
@@ -125,12 +133,13 @@ def _handle_collect(chat_id: int, state: str) -> None:
 
 
 def _handle_send(chat_id: int, state: str, limit: int) -> None:
+    # ===== 🟢 НОВЫЙ БЛОК ОТЧЕТА 🟢 =====
     tg_send(chat_id, f"Начинаю рассылку для {state} (лимит: {limit})...")
     try:
         report = run_send(state=state, limit=limit)
         text = (
             f"<b>Рассылка {state} (лимит {limit})</b>\n"
-            f"---\n"
+            f"---\n"  # <-- 🟢 ИСПРАВЛЕНИЕ 2
             f"✅ Отправлено: {report['sent']}\n"
             f"❌ Невалидных (-> INVALID): {report['invalid']}\n"
             f"🚫 Ошибок отправки (SMTP): {report['failed_send']}\n"
@@ -186,6 +195,7 @@ def _imap_fetch_unseen_froms(n_last: int = 50) -> List[str]:
 
 
 def _handle_replies(chat_id: int) -> None:
+    # ===== 🟢 Это твоя логика проверки ответов 🟢 =====
     tg_send(chat_id, "Проверяю почту (IMAP)...")
     try:
         from_list = _imap_fetch_unseen_froms()
@@ -341,4 +351,5 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
         _handle_replies(chat_id)
         return {"ok": True}
 
-    tg_send(chat
+    tg_send(chat_id, "Не понимаю команду. Напиши /help")
+    return {"ok": True}
