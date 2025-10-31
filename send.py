@@ -12,7 +12,7 @@ from clickup_client import (
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
-from telegram_bot import _task_status_str # Импортируем хелпер статуса
+from utils import _task_status_str # <-- 🟢 ИСПРАВЛЕНИЕ
 
 log = logging.getLogger("sender")
 router = APIRouter()
