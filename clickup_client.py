@@ -2,6 +2,7 @@
 import os
 import logging
 from typing import Any, Dict, List, Optional
+import re # <-- Добавлен import re
 
 import requests
 
@@ -12,7 +13,7 @@ CLICKUP_BASE = "https://api.clickup.com/api/v2"
 CLICKUP_API_TOKEN = os.getenv("CLICKUP_API_TOKEN", "")
 CLICKUP_SPACE_ID = os.getenv("CLICKUP_SPACE_ID", "")
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
-# он у нас есть в env, но мы его БОЛЬШЕ НЕ ИСПОЛЬЗUЕМ специально
+# он у нас есть в env, но мы его БОЛЬШЕ НЕ ИСПОЛЬЗУЕМ специально
 CLICKUP_TEMPLATE_LIST_ID = os.getenv("CLICKUP_TEMPLATE_LIST_ID", "")
 
 # ===== наши статусы =====
@@ -48,18 +49,21 @@ class ClickUpClient:
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         r = self.session.get(url, params=params, timeout=25)
         if r.status_code >= 300:
+            log.warning("ClickUp GET %s -> %s %s", url, r.status_code, r.text[:200])
             raise ClickUpError(f"GET {url} -> {r.status_code} {r.text}")
         return r.json()
 
     def _post(self, url: str, json: Dict[str, Any]) -> Dict[str, Any]:
         r = self.session.post(url, json=json, timeout=25)
         if r.status_code >= 300:
+            log.warning("ClickUp POST %s -> %s %s", url, r.status_code, r.text[:200])
             raise ClickUpError(f"POST {url} -> {r.status_code} {r.text}")
         return r.json()
 
     def _put(self, url: str, json: Dict[str, Any]) -> Dict[str, Any]:
         r = self.session.put(url, json=json, timeout=25)
         if r.status_code >= 300:
+            log.warning("ClickUp PUT %s -> %s %s", url, r.status_code, r.text[:200])
             raise ClickUpError(f"PUT {url} -> {r.status_code} {r.text}")
         return r.json()
 
@@ -176,7 +180,7 @@ class ClickUpClient:
     # ---------------- tasks ----------------
 
     def get_leads_from_list(self, list_id: str) -> List[Dict[str, Any]]:
-        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ ПАГИНАЦИИ 🟢 =====
+        # Это наша функция с пагинацией из прошлого шага
         url = f"{CLICKUP_BASE}/list/{list_id}/task"
         all_tasks: List[Dict[str, Any]] = []
         page = 0
@@ -186,7 +190,11 @@ class ClickUpClient:
                 "subtasks": "true",
                 "page": page
             }
-            data = self._get(url, params=params)
+            try:
+                data = self._get(url, params=params)
+            except ClickUpError:
+                break # Ошибка (напр. 404)
+                
             tasks = data.get("tasks", [])
             
             if not tasks:
@@ -197,7 +205,33 @@ class ClickUpClient:
             page += 1
             
         return all_tasks
-        # ===== 🟢 КОНЕЦ ИСПРАВЛЕНИЯ 🟢 =====
+
+    def get_task_details(self, task_id: str) -> Dict[str, Any]:
+        """
+        (!!!) НОВАЯ ФУНКЦИЯ (!!!)
+        Загружает полную инфу о задаче, включая 'description' (заметки).
+        """
+        url = f"{CLICKUP_BASE}/task/{task_id}"
+        try:
+            # Запрашиваем 'description' в markdown, чтобы парсить было проще
+            return self._get(url, params={"markdown_description": "true"})
+        except ClickUpError as e:
+            log.warning("clickup:cannot get task details for %s: %s", task_id, e)
+            return {}
+
+    def add_tag(self, task_id: str, tag_name: str) -> bool:
+        """
+        (!!!) НОВАЯ ФУНКЦИЯ (!!!)
+        Добавляет тег к задаче.
+        """
+        url = f"{CLICKUP_BASE}/task/{task_id}/tag/{tag_name}"
+        try:
+            self._post(url, json={}) # Тело запроса пустое
+            log.info("clickup:added tag %s to task %s", tag_name, task_id)
+            return True
+        except ClickUpError as e:
+            log.warning("clickup:cannot add tag %s to task %s: %s", tag_name, task_id, e)
+            return False
 
     def create_task(
         self,
@@ -265,9 +299,18 @@ class ClickUpClient:
             # другое — пусть валится
             raise
 
-    def update_task_status(self, task_id: str, status: str) -> None:
+    def update_task_status(self, task_id: str, status: str) -> bool:
+        """
+        Меняем статус задачи. Возвращаем True/False.
+        """
         url = f"{CLICKUP_BASE}/task/{task_id}"
-        self._put(url, {"status": status})
+        try:
+            self._put(url, {"status": status})
+            log.info("clickup:moved task %s to status %s", task_id, status)
+            return True
+        except ClickUpError as e:
+            log.warning("clickup:cannot move task %s to status %s: %s", task_id, status, e)
+            return False
 
     # ---------------- higher level ----------------
 
@@ -285,6 +328,10 @@ class ClickUpClient:
 
         # пробуем получить id полей, но если ничего не вышло — просто не будем их слать
         field_ids = self._ensure_required_fields(list_id)
+
+        # Мы больше не используем кастомные поля для Email/Website,
+        # но мы все еще можем использовать их для Facebook/Inst/LinkedIn, если парсер их найдет.
+        # Поэтому эту логику можно оставить.
 
         if not any(field_ids.values()):
             # вообще нет полей → создаём без них
@@ -314,31 +361,51 @@ class ClickUpClient:
         )
         return True
 
-    def move_lead_to_status(self, task_id: str, status: str) -> None:
-        self.update_task_status(task_id, status)
+    def move_lead_to_status(self, task_id: str, status: str) -> bool:
+        # Это алиас для update_task_status
+        return self.update_task_status(task_id, status)
 
     def find_task_by_email(self, email_addr: str) -> Optional[Dict[str, Any]]:
+        """
+        Ищет задачу, парся 'description', т.к. кастомных полей больше нет.
+        """
         lists = self._list_lists_in_space()
-        for lst in lists:
+        for lst in lists: # 'lst' - это сам объект списка
             lid = lst.get("id")
+            list_name = lst.get("name", "") # <-- 🟢 ИЗМЕНЕНИЕ: Получаем имя списка
             if not lid:
                 continue
+            
+            # 1. Получаем легкие задачи
             tasks = self.get_leads_from_list(lid)
-            fields_map = self._list_custom_fields(lid)
-            email_field_id = fields_map.get("Email")
-            if not email_field_id:
+            if not tasks:
                 continue
-            for t in tasks:
-                for cf in t.get("custom_fields", []):
-                    if (
-                        cf.get("id") == email_field_id
-                        and (cf.get("value") or "").lower() == email_addr.lower()
-                    ):
-                        return {
-                            "task_id": t["id"],
-                            "clinic_name": t.get("name") or "",
-                            "list_id": lid,
-                        }
+
+            # 2. Перебираем их
+            for task_stub in tasks:
+                task_id = task_stub.get("id")
+                if not task_id:
+                    continue
+                
+                # 3. Получаем детали (с 'description')
+                task_full = self.get_task_details(task_id)
+                desc = task_full.get("description", "")
+                
+                # 4. Ищем email в description
+                if email_addr.lower() in desc.lower():
+                    # Простая проверка. Можно улучшить regex-ом
+                    
+                    # Ищем email с помощью regex
+                    match = re.search(r"Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", desc, re.IGNORECASE)
+                    if match:
+                        found_email = match.group(1)
+                        if found_email.lower() == email_addr.lower():
+                            return {
+                                "task_id": task_id,
+                                "clinic_name": task_full.get("name") or "",
+                                "list_id": lid,
+                                "list_name": list_name # <-- 🟢 ИЗМЕНЕНИЕ: Возвращаем имя списка
+                            }
         return None
 
 
