@@ -144,8 +144,10 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg["To"] = to_email
 
     try:
-        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
-        server.starttls() # Используем STARTTLS
+        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢 =====
+        # Используем SMTP_SSL, т.к. твой сервер (судя по IMAP) ожидает SSL, а не STARTTLS.
+        server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
+        # .starttls() НЕ НУЖЕН
         server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
         server.sendmail(settings.SMTP_FROM, [to_email], msg.as_string())
         server.quit()
@@ -153,6 +155,4 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
         return True
     except Exception as e:
         log.error("Failed to send email via SMTP: %s", e)
-        # Ты прислал smtplib.SMTP_SSL, но обычно используют .SMTP() + .starttls()
-        # Если тот вариант у тебя работал, верни smtplib.SMTP_SSL(..., ...)
         return False
