@@ -13,8 +13,7 @@ from clickup_client import (
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
-# 🟢 ИМПОРТ УДАЛЕН ОТСЮДА 🟢
-# from telegram_bot import _task_status_str 
+from telegram_bot import _task_status_str 
 
 log = logging.getLogger("sender")
 router = APIRouter()
@@ -38,8 +37,10 @@ def _parse_details(description: str) -> Dict[str, str]:
     if email_match:
         email = email_match.group(1).strip()
 
+    # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ ДЛЯ САЙТА 🟢 =====
+    # Ищем ЛЮБОЙ текст после "Website:", а не только http
     website_match = re.search(
-        r"^\s*Website:?\s*[\r\n\s]*(https?://[^\s]+)",
+        r"^\s*Website:?\s*[\r\n\s]*([^\s]+)",
         description,
         re.IGNORECASE | re.MULTILINE
     )
@@ -51,7 +52,6 @@ def _parse_details(description: str) -> Dict[str, str]:
 
 def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
     
-    # 🟢 ВОТ ИСПРАВЛЕНИЕ: 🟢
     # Мы импортируем функцию здесь, а не вверху файла.
     # Это разрывает "циклический импорт".
     from telegram_bot import _task_status_str
