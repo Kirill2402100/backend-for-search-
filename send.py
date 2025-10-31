@@ -9,24 +9,20 @@ from clickup_client import (
     READY_STATUS,
     SENT_STATUS,
     INVALID_STATUS,
-    NEW_STATUS  # Этот импорт мы добавили в прошлый раз
+    NEW_STATUS
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
-from telegram_bot import _task_status_str # Импортируем хелпер статуса
+# 🟢 ИМПОРТ УДАЛЕН ОТСЮДА 🟢
+# from telegram_bot import _task_status_str 
 
 log = logging.getLogger("sender")
 router = APIRouter()
 
 def _parse_details(description: str) -> Dict[str, str]:
     """
-    (!!!) ОБНОВЛЕННАЯ ФУНКЦИЯ (!!!)
+    (Это наша обновленная функция)
     Парсит Email и Website из 'description' (заметок) задачи.
-    Теперь понимает оба формата:
-    Email: test@example.com
-    ИЛИ
-    Email
-    test@example.com
     """
     email = None
     website = None
@@ -34,9 +30,6 @@ def _parse_details(description: str) -> Dict[str, str]:
     if not description:
         return {}
 
-    # re.IGNORECASE - неважно, 'Email:' или 'email:'
-    # re.MULTILINE - ищет в каждой строке
-    # [\r\n\s]* - ищет email ЛИБО на той же строке (через \s), ЛИБО на следующей (через \r\n)
     email_match = re.search(
         r"^\s*Email:?\s*[\r\n\s]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
         description,
@@ -57,6 +50,12 @@ def _parse_details(description: str) -> Dict[str, str]:
 
 
 def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
+    
+    # 🟢 ВОТ ИСПРАВЛЕНИЕ: 🟢
+    # Мы импортируем функцию здесь, а не вверху файла.
+    # Это разрывает "циклический импорт".
+    from telegram_bot import _task_status_str
+    
     try:
         list_id = clickup_client.get_or_create_list_for_state(state)
         # 1. Получаем ВСЕ задачи (легкие)
