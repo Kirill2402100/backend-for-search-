@@ -99,12 +99,10 @@ def _stats_for_state(state: str) -> str:
     return (
         f"<b>Статистика {state}</b>\n"
         f"Всего в листе: {total}\n"
-        f"---
-"
+        f"---\n"  # <-- 🟢 ИСПРАВЛЕНИЕ 1
         f"В подготовке (NEW): {new_cnt}\n"
         f"Готовы к отправке (READY): {ready_cnt}\n"
-        f"---
-"
+        f"---\n"
         f"Отправлено (SENT): {sent_cnt}\n"
         f"Получен ответ (REPLIED): {replied_cnt}\n"
         f"Невалидные (INVALID): {invalid_cnt}\n"
@@ -141,14 +139,12 @@ def _handle_send(chat_id: int, state: str, limit: int) -> None:
         report = run_send(state=state, limit=limit)
         text = (
             f"<b>Рассылка {state} (лимит {limit})</b>\n"
-            f"---
-"
+            f"---\n"  # <-- 🟢 ИСПРАВЛЕНИЕ 2
             f"✅ Отправлено: {report['sent']}\n"
             f"❌ Невалидных (-> INVALID): {report['invalid']}\n"
             f"🚫 Ошибок отправки (SMTP): {report['failed_send']}\n"
             f"🤔 Пропущено (нет Email): {report['skipped_no_email']}\n"
-            f"---
-"
+            f"---\n"
             f"📈 Осталось в 'READY': {report['remaining_ready']}\n"
             f"📊 В подготовке 'NEW': {report['total_new']}\n"
             f"Σ Всего в листе: {report['total_in_list']}"
@@ -199,7 +195,7 @@ def _imap_fetch_unseen_froms(n_last: int = 50) -> List[str]:
 
 
 def _handle_replies(chat_id: int) -> None:
-    # ===== 🟢 ИЗМЕНЕНИЕ ЗДЕСЬ 🟢 =====
+    # ===== 🟢 Это твоя логика проверки ответов 🟢 =====
     tg_send(chat_id, "Проверяю почту (IMAP)...")
     try:
         from_list = _imap_fetch_unseen_froms()
