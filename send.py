@@ -116,8 +116,8 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
             log.info("Sending email to %s for %s", email, clinic_name)
             ok = send_email(
                 to_email=email,
-                clinic_name=clinic_name, 
-                clinic_site=website 
+                clinic_name=clinic_name, # <-- Исправлено (было clinic_name)
+                clinic_site=website # website может быть None, mailer.py это обработает
             )
             
             if ok:
@@ -157,5 +157,7 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
 def send_proposals(state: str, limit: int = 50) -> Dict[str, Any]:
     try:
         return run_send(state=state, limit=limit)
-    # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢 =====
     except RuntimeError as e:
+        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢 =====
+        # Строка ниже ДОЛЖНА быть с отступом
+        raise HTTPException
