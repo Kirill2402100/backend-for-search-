@@ -2,6 +2,7 @@
 from typing import Dict, Any, Optional, List
 import imaplib
 import email
+import logging
 
 from config import settings
 from clickup_client import (
@@ -10,11 +11,13 @@ from clickup_client import (
     SENT_STATUS,
     REPLIED_STATUS,
     NEW_STATUS,
+    INVALID_STATUS # Добавим
 )
 from telegram_notifier import send_message as tg_send
-from send import run_send
+from send import run_send # <-- Импортируем новый run_send
 from leads import upsert_leads_for_state
 
+log = logging.getLogger("telegram_bot")
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
 US_STATES = [
@@ -64,14 +67,19 @@ def _task_status_str(task: Dict[str, Any]) -> str:
 
 
 def _stats_for_state(state: str) -> str:
-    list_id = clickup_client.get_or_create_list_for_state(state)
-    tasks = clickup_client.get_leads_from_list(list_id)
+    try:
+        list_id = clickup_client.get_or_create_list_for_state(state)
+        tasks = clickup_client.get_leads_from_list(list_id)
+    except Exception as e:
+        log.error("Failed to get stats for %s: %s", state, e)
+        return f"Ошибка получения статистики для {state}: {e}"
 
     total = len(tasks)
-
     new_cnt = 0
     ready_cnt = 0
     sent_cnt = 0
+    replied_cnt = 0
+    invalid_cnt = 0
 
     for t in tasks:
         st = _task_status_str(t).upper()
@@ -81,96 +89,152 @@ def _stats_for_state(state: str) -> str:
             ready_cnt += 1
         elif st == SENT_STATUS:
             sent_cnt += 1
-
-    remain = total - sent_cnt
+        elif st == REPLIED_STATUS:
+            replied_cnt += 1
+        elif st == INVALID_STATUS:
+            invalid_cnt += 1
+            
+    other_cnt = total - (new_cnt + ready_cnt + sent_cnt + replied_cnt + invalid_cnt)
 
     return (
-        f"Статистика {state}\n"
+        f"<b>Статистика {state}</b>\n"
         f"Всего в листе: {total}\n"
-        f"NEW: {new_cnt}\n"
-        f"Готовы к отправке: {ready_cnt}\n"
-        f"Отправлено: {sent_cnt}\n"
-        f"Осталось (не отправлено): {remain}"
+        f"---
+"
+        f"В подготовке (NEW): {new_cnt}\n"
+        f"Готовы к отправке (READY): {ready_cnt}\n"
+        f"---
+"
+        f"Отправлено (SENT): {sent_cnt}\n"
+        f"Получен ответ (REPLIED): {replied_cnt}\n"
+        f"Невалидные (INVALID): {invalid_cnt}\n"
+        f"Другие статусы: {other_cnt}"
     )
 
 
 def _handle_collect(chat_id: int, state: str) -> None:
-    # собираем
-    report = upsert_leads_for_state(state)
+    tg_send(chat_id, f"Начинаю сбор для {state}... (Google ищет)")
+    try:
+        # собираем
+        report = upsert_leads_for_state(state)
+        
+        # после сбора ещё раз считаем по факту
+        stats = _stats_for_state(state)
 
-    # после сбора ещё раз считаем по факту
-    stats = _stats_for_state(state)
-
-    text = (
-        f"Сбор завершён: {state}\n"
-        f"Найдено: {report['found']}\n"
-        f"Создано новых: {report['created']}\n"
-        f"Пропущено (дубликаты/ошибки): {report['skipped']}\n\n"
-        f"{stats}"
-    )
-    tg_send(chat_id, text)
+        text = (
+            f"<b>Сбор завершён: {state}</b>\n"
+            f"Найдено: {report['found']}\n"
+            f"Создано новых: {report['created']}\n"
+            f"Пропущено (дубликаты): {report['skipped']}\n\n"
+            f"{stats}"
+        )
+        tg_send(chat_id, text, parse_mode="HTML")
+    except Exception as e:
+        log.error("Handle_collect error: %s", e)
+        tg_send(chat_id, f"Ошибка при сборе {state}: {e}")
 
 
 def _handle_send(chat_id: int, state: str, limit: int) -> None:
-    report = run_send(state=state, limit=limit)
-    text = (
-        f"<b>Рассылка {state}</b>\n"
-        f"Отправлено: {report['sent']}\n"
-        f"Невалидных: {report['invalid']}\n"
-        f"Без email: {report['skipped_no_email']}\n"
-        f"Ошибок отправки: {report['failed_send']}\n"
-        f"Осталось (с email, не отправлено): {report['remaining_unsent']}\n"
-        f"Всего в листе: {report['total_in_list']}"
-    )
-    tg_send(chat_id, text, parse_mode="HTML")
+    # ===== 🟢 НОВЫЙ БЛОК ОТЧЕТА 🟢 =====
+    tg_send(chat_id, f"Начинаю рассылку для {state} (лимит: {limit})...")
+    try:
+        report = run_send(state=state, limit=limit)
+        text = (
+            f"<b>Рассылка {state} (лимит {limit})</b>\n"
+            f"---
+"
+            f"✅ Отправлено: {report['sent']}\n"
+            f"❌ Невалидных (-> INVALID): {report['invalid']}\n"
+            f"🚫 Ошибок отправки (SMTP): {report['failed_send']}\n"
+            f"🤔 Пропущено (нет Email): {report['skipped_no_email']}\n"
+            f"---
+"
+            f"📈 Осталось в 'READY': {report['remaining_ready']}\n"
+            f"📊 В подготовке 'NEW': {report['total_new']}\n"
+            f"Σ Всего в листе: {report['total_in_list']}"
+        )
+        tg_send(chat_id, text, parse_mode="HTML")
+    except Exception as e:
+        log.error("Handle_send error: %s", e)
+        tg_send(chat_id, f"Ошибка при рассылке {state}: {e}")
 
 
 def _imap_fetch_unseen_froms(n_last: int = 50) -> List[str]:
     host = getattr(settings, "SMTP_HOST", "mail.adm.tools")
+    port = getattr(settings, "SMTP_IMAP_PORT", 993)
     username = settings.SMTP_USERNAME
     password = settings.SMTP_PASSWORD
 
     out: List[str] = []
-    M = imaplib.IMAP4_SSL(host, 993)
-    M.login(username, password)
-    M.select("INBOX")
-    status, data = M.search(None, "UNSEEN")
-    if status != "OK":
-        M.logout()
-        return out
+    try:
+        M = imaplib.IMAP4_SSL(host, port)
+        M.login(username, password)
+        M.select("INBOX")
+        status, data = M.search(None, "UNSEEN")
+        if status != "OK":
+            M.logout()
+            return out
 
-    ids = data[0].split()[-n_last:]
-    for msg_id in ids:
-        typ, msg_data = M.fetch(msg_id, "(RFC822)")
-        if typ != "OK":
-            continue
-        msg = email.message_from_bytes(msg_data[0][1])
-        from_hdr = email.utils.parseaddr(msg.get("From"))[1]
-        out.append(from_hdr)
-        M.store(msg_id, "+FLAGS", "\\Seen")
-    M.logout()
+        ids = data[0].split()[-n_last:]
+        if not ids:
+            M.logout()
+            return out
+            
+        log.info("IMAP: found %d unseen emails", len(ids))
+
+        for msg_id in ids:
+            typ, msg_data = M.fetch(msg_id, "(RFC822)")
+            if typ != "OK":
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            from_hdr = email.utils.parseaddr(msg.get("From"))[1]
+            if from_hdr and from_hdr != username:
+                out.append(from_hdr)
+                # Помечаем как прочитанное
+                M.store(msg_id, "+FLAGS", "\\Seen")
+        M.logout()
+    except Exception as e:
+        log.error("IMAP fetch failed: %s", e)
     return out
 
 
 def _handle_replies(chat_id: int) -> None:
-    from_list = _imap_fetch_unseen_froms()
-    if not from_list:
-        tg_send(chat_id, "Новых ответов нет.")
-        return
+    # ===== 🟢 ИЗМЕНЕНИЕ ЗДЕСЬ 🟢 =====
+    tg_send(chat_id, "Проверяю почту (IMAP)...")
+    try:
+        from_list = _imap_fetch_unseen_froms()
+        if not from_list:
+            tg_send(chat_id, "Новых ответов нет.")
+            return
 
-    moved = 0
-    for addr in from_list:
-        task = clickup_client.find_task_by_email(addr)
-        if task:
-            clickup_client.move_lead_to_status(task["task_id"], REPLIED_STATUS)
-            moved += 1
-            tg_send(
-                chat_id,
-                f"Ответ от <b>{task['clinic_name']}</b> ({addr}). Перенесено в «{REPLIED_STATUS}».",
-                parse_mode="HTML",
-            )
-    if moved == 0:
-        tg_send(chat_id, "Ответы получены, но соответствующие задачи не найдены.")
+        log.info("IMAP: processing replies from: %s", from_list)
+        moved = 0
+        for addr in from_list:
+            task = clickup_client.find_task_by_email(addr)
+            if task:
+                log.info("IMAP: Found task %s for email %s", task['task_id'], addr)
+                clickup_client.move_lead_to_status(task["task_id"], REPLIED_STATUS)
+                moved += 1
+                
+                # --- Логика для извлечения штата ---
+                list_name = task.get('list_name', '') # e.g., "LEADS-NY"
+                state = list_name.replace('LEADS-', '').upper() # e.g., "NY"
+                state_info = f" (Штат: {state})" if state in US_STATES else ""
+                # ---
+                
+                tg_send(
+                    chat_id,
+                    f"📩 Ответ от <b>{task['clinic_name']}</b>{state_info}.\nПеренесено в «{REPLIED_STATUS}».",
+                    parse_mode="HTML",
+                )
+            else:
+                log.warning("IMAP: No task found for email %s", addr)
+                
+        if moved == 0:
+            tg_send(chat_id, f"Получено {len(from_list)} ответов, но не нашел для них задач в ClickUp.")
+    except Exception as e:
+        log.error("Handle_replies error: %s", e)
+        tg_send(chat_id, f"Ошибка при проверке ответов: {e}")
 
 
 def _help_text() -> str:
@@ -222,6 +286,7 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
     if not chat_id or not text:
         return {"ok": True}
     if not _allowed_chat(chat_id):
+        log.warning("Ignoring message from disallowed chat_id %s", chat_id)
         return {"ok": True}
 
     if text.upper() in US_STATES:
@@ -256,16 +321,26 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True}
 
     if cmd == "/send":
-        if len(parts) == 3:
-            state = parts[1].upper()
-            lim = int(parts[2])
-        else:
-            state = USER_STATE.get(chat_id)
-            if not state:
-                tg_send(chat_id, "Сначала укажи штат: /send NY 1 или выбери через /menu")
+        try:
+            if len(parts) == 3:
+                state = parts[1].upper()
+                lim_str = parts[2]
+            else:
+                state = USER_STATE.get(chat_id)
+                lim_str = parts[1] if len(parts) > 1 else "50" # default 50
+            
+            if not state or state not in US_STATES:
+                tg_send(chat_id, "Сначала укажи штат: /send NY 10 или выбери через /menu")
                 return {"ok": True}
-            lim = int(parts[1]) if len(parts) > 1 else 50
-        _handle_send(chat_id, state, lim)
+            
+            limit = int(lim_str)
+            if limit <= 0 or limit > 500:
+                tg_send(chat_id, "Лимит должен быть от 1 до 500.")
+                return {"ok": True}
+                
+            _handle_send(chat_id, state, limit)
+        except (ValueError, IndexError):
+            tg_send(chat_id, "Неверный формат. \nПример: /send NY 10\nИли выбери штат и напиши: /send 10")
         return {"ok": True}
 
     if cmd == "/stats":
@@ -273,7 +348,7 @@ def handle_update(update: Dict[str, Any]) -> Dict[str, Any]:
         if not state or state not in US_STATES:
             tg_send(chat_id, "Укажи штат: /stats NY или выбери через /menu")
             return {"ok": True}
-        tg_send(chat_id, _stats_for_state(state))
+        tg_send(chat_id, _stats_for_state(state), parse_mode="HTML")
         return {"ok": True}
 
     if cmd == "/replies":
