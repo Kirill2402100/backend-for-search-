@@ -8,14 +8,30 @@ from clickup_client import (
     clickup_client,
     READY_STATUS,
     SENT_STATUS,
-    INVALID_STATUS
+    INVALID_STATUS,
+    NEW_STATUS  # <-- 🟢 1. ДОБАВЛЕН ИМПОРТ
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
-from utils import _task_status_str # <-- 🟢 ИСПРАВЛЕНИЕ
+# from telegram_bot import _task_status_str # <-- Убран циклический импорт
 
 log = logging.getLogger("sender")
 router = APIRouter()
+
+
+# ===== 🟢 2. ФУНКЦИЯ СКОПИРОВАНА СЮДА 🟢 =====
+def _task_status_str(task: Dict[str, Any]) -> str:
+    """
+    ClickUp иногда возвращает 'status': 'open', а иногда 'status': {'status': 'open', ...}
+    """
+    st = task.get("status")
+    if isinstance(st, str):
+        return st
+    if isinstance(st, dict):
+        return st.get("status") or st.get("value") or ""
+    return ""
+# ===== 🟢 КОНЕЦ КОПИИ 🟢 =====
+
 
 def _parse_details(description: str) -> Dict[str, str]:
     """
@@ -116,8 +132,8 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
             log.info("Sending email to %s for %s", email, clinic_name)
             ok = send_email(
                 to_email=email,
-                clinic_name=clinic_name, # <-- Исправлено (было clinic_name)
-                clinic_site=website # website может быть None, mailer.py это обработает
+                clinic_name=clinic_name, 
+                clinic_site=website 
             )
             
             if ok:
@@ -135,10 +151,10 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
 
     # 7. Считаем статистику для отчета
     
-    # Пересчитываем, сколько ОСТАЛОСЬ в "READY" (total_ready - (sent + invalid + failed))
-    remaining_ready = len(ready_tasks) - (sent + invalid_count + failed_send)
+    # Пересчитываем, сколько ОСТАЛОСЬ в "READY"
+    remaining_ready = len(ready_tasks) - len(tasks_to_process)
     
-    # Считаем, сколько в "NEW"
+    # Считаем, сколько в "NEW" (теперь _task_status_str и NEW_STATUS известны)
     new_count = sum(1 for t in all_tasks if _task_status_str(t).upper() == NEW_STATUS)
 
     return {
@@ -157,5 +173,4 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
 def send_proposals(state: str, limit: int = 50) -> Dict[str, Any]:
     try:
         return run_send(state=state, limit=limit)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except RuntimeError as
