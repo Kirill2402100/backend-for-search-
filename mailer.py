@@ -1,7 +1,7 @@
 # mailer.py
 import smtplib
 import logging
-import re  # <-- 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢
+import re
 from email.mime.text import MIMEText
 from email.utils import formataddr
 from typing import Optional
@@ -9,16 +9,14 @@ from config import settings
 
 log = logging.getLogger("mailer")
 
-def build_email_html(clinic_name: str, clinic_site: Optional[str]) -> str:
+# ===== 🟢 ИЗМЕНЕНИЕ 1: 'subject' добавлен в аргументы 🟢 =====
+def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str) -> str:
     safe_clinic = clinic_name.strip() if clinic_name else "your practice"
     
-    # Если сайта нет, используем "your website". 
-    # Если есть, но без http, добавляем его.
     safe_site_text = "your website"
     safe_site_link = "#"
     
     if clinic_site:
-        # Убираем http/https и www для "красивого" текста
         safe_site_text = re.sub(r"^(https?://)?(www\.)?", "", clinic_site).strip('/')
         
         if not clinic_site.startswith("http"):
@@ -64,9 +62,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str]) -> str:
 <p style="margin: 0 0 16px 0;"><b>Just reply to this email — we’ll handle the rest.</b></p>
 """
 
-    # ===== 🟢 НОВАЯ "ПУЛЕНЕПРОБИВАЕМАЯ" ПОДПИСЬ 🟢 =====
-    
-    # !!! ЗАМЕНИ ЭТУ ССЫЛКУ на настоящую фотку Светланы !!!
     avatar_url = "https://i.ibb.co/L8x10B1/default-avatar.png" # Это рабочая заглушка
     
     signature_html = f"""
@@ -162,7 +157,9 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str]) -> str:
 
 def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> bool:
     subject = "Quick audit: a few easy wins for your dental website 🦷"
-    html_body = build_email_html(clinic_name, clinic_site)
+    
+    # ===== 🟢 ИЗМЕНЕНИЕ 2: 'subject' передается сюда 🟢 =====
+    html_body = build_email_html(clinic_name, clinic_site, subject=subject)
 
     msg = MIMEText(html_body, "html", "utf-8")
     msg["Subject"] = subject
@@ -170,7 +167,6 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg["To"] = to_email
 
     try:
-        # Это наша рабочая конфигурация
         server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
         server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
         server.sendmail(settings.SMTP_FROM, [to_email], msg.as_string())
