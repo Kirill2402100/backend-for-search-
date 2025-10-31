@@ -62,7 +62,9 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 <p style="margin: 0 0 16px 0;"><b>Just reply to this email — we’ll handle the rest.</b></p>
 """
 
-    avatar_url = "https://i.ibb.co/L8x10B1/default-avatar.png" # Это рабочая заглушка
+    # !!! ЗАМЕНИ ЭТУ ССЫЛКУ на настоящую фотку Светланы !!!
+    # Я взял рабочую заглушку, т.к. imgbb.com с твоего скриншота не открылся
+    avatar_url = "https://i.ibb.co/L8x10B1/default-avatar.png" 
     
     signature_html = f"""
 <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border-top:1px solid #e0e0e0; margin-top:24px; padding-top:24px;">
@@ -167,6 +169,7 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg["To"] = to_email
 
     try:
+        # Мы используем твой рабочий SMTP (SSL)
         server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
         server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
         server.sendmail(settings.SMTP_FROM, [to_email], msg.as_string())
