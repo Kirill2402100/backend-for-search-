@@ -9,7 +9,7 @@ from clickup_client import (
     READY_STATUS,
     SENT_STATUS,
     INVALID_STATUS,
-    NEW_STATUS  # <-- 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢
+    NEW_STATUS  # Этот импорт мы добавили в прошлый раз
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
@@ -20,10 +20,13 @@ router = APIRouter()
 
 def _parse_details(description: str) -> Dict[str, str]:
     """
+    (!!!) ОБНОВЛЕННАЯ ФУНКЦИЯ (!!!)
     Парсит Email и Website из 'description' (заметок) задачи.
-    Ожидает формат:
+    Теперь понимает оба формата:
     Email: test@example.com
-    Website: https://example.com
+    ИЛИ
+    Email
+    test@example.com
     """
     email = None
     website = None
@@ -33,8 +36,9 @@ def _parse_details(description: str) -> Dict[str, str]:
 
     # re.IGNORECASE - неважно, 'Email:' или 'email:'
     # re.MULTILINE - ищет в каждой строке
+    # [\r\n\s]* - ищет email ЛИБО на той же строке (через \s), ЛИБО на следующей (через \r\n)
     email_match = re.search(
-        r"^\s*Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
+        r"^\s*Email:?\s*[\r\n\s]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})",
         description,
         re.IGNORECASE | re.MULTILINE
     )
@@ -42,7 +46,7 @@ def _parse_details(description: str) -> Dict[str, str]:
         email = email_match.group(1).strip()
 
     website_match = re.search(
-        r"^\s*Website:\s*(https?://[^\s]+)",
+        r"^\s*Website:?\s*[\r\n\s]*(https?://[^\s]+)",
         description,
         re.IGNORECASE | re.MULTILINE
     )
@@ -92,7 +96,7 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
             task_details = clickup_client.get_task_details(task_id)
             description = task_details.get("description", "")
             
-            # 6. Парсим 'description'
+            # 6. Парсим 'description' (уже новой, умной функцией)
             parsed_data = _parse_details(description)
             email = parsed_data.get("email")
             website = parsed_data.get("website")
@@ -136,12 +140,11 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
 
     # 7. Считаем статистику для отчета
     
-    # Пересчитываем, сколько ОСТАЛОСЬ в "READY" (total_ready - (sent + invalid + failed))
-    # Убедимся, что не ушли в минус, если limit был меньше, чем ready
+    # Пересчитываем, сколько ОСТАЛОСЬ в "READY"
     processed_count = sent + invalid_count + failed_send + skipped_no_email
     remaining_ready = len(ready_tasks) - processed_count
     if remaining_ready < 0:
-        remaining_ready = 0 # Защита, если обработали больше, чем было (напр. гонка)
+        remaining_ready = 0 
     
     # Считаем, сколько в "NEW"
     new_count = sum(1 for t in all_tasks if _task_status_str(t).upper() == NEW_STATUS)
