@@ -14,9 +14,9 @@ from clickup_client import (
     INVALID_STATUS
 )
 from telegram_notifier import send_message as tg_send
-from send import run_send 
+from send import run_send
 from leads import upsert_leads_for_state
-from utils import _task_status_str # <-- 🟢 ИМПОРТ ИЗ НОВОГО ФАЙЛА
+from utils import _task_status_str  # <-- 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢
 
 log = logging.getLogger("telegram_bot")
 TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -54,9 +54,9 @@ def _parse_cmd(text: str) -> List[str]:
     parts = text.strip().split()
     return [p.strip() for p in parts if p.strip()]
 
-# 
-# 🟢 ФУНКЦИЯ _task_status_str УДАЛЕНА ОТСЮДА И ПЕРЕЕХАЛА В utils.py 🟢
-#
+
+# 🟢 ФУНКЦИЯ _task_status_str УДАЛЕНА ОТСЮДА (она теперь в utils.py) 🟢
+
 
 def _stats_for_state(state: str) -> str:
     try:
@@ -74,8 +74,7 @@ def _stats_for_state(state: str) -> str:
     invalid_cnt = 0
 
     for t in tasks:
-        # Используем импортированную функцию
-        st = _task_status_str(t).upper() 
+        st = _task_status_str(t).upper() # <-- Эта функция теперь из utils.py
         if st == NEW_STATUS:
             new_cnt += 1
         elif st == READY_STATUS:
