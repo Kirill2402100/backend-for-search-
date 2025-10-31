@@ -8,11 +8,12 @@ from clickup_client import (
     clickup_client,
     READY_STATUS,
     SENT_STATUS,
-    INVALID_STATUS
+    INVALID_STATUS,
+    NEW_STATUS  # <-- 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
-from utils import _task_status_str # <-- 🟢 ИСПРАВЛЕН ИМПОРТ
+from telegram_bot import _task_status_str # Импортируем хелпер статуса
 
 log = logging.getLogger("sender")
 router = APIRouter()
@@ -63,8 +64,7 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
     # 2. Фильтруем по статусу "READY"
     ready_tasks = []
     for t in all_tasks:
-        # Используем импортированную функцию
-        if _task_status_str(t).upper() == READY_STATUS: 
+        if _task_status_str(t).upper() == READY_STATUS:
             ready_tasks.append(t)
     
     # 3. Берем 'limit' из готовых к отправке
@@ -117,7 +117,7 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
             log.info("Sending email to %s for %s", email, clinic_name)
             ok = send_email(
                 to_email=email,
-                clinic_name=clinic_name,
+                clinic_name=clinic_name, 
                 clinic_site=website # website может быть None, mailer.py это обработает
             )
             
@@ -137,7 +137,11 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
     # 7. Считаем статистику для отчета
     
     # Пересчитываем, сколько ОСТАЛОСЬ в "READY" (total_ready - (sent + invalid + failed))
-    remaining_ready = len(ready_tasks) - (sent + invalid_count + failed_send)
+    # Убедимся, что не ушли в минус, если limit был меньше, чем ready
+    processed_count = sent + invalid_count + failed_send + skipped_no_email
+    remaining_ready = len(ready_tasks) - processed_count
+    if remaining_ready < 0:
+        remaining_ready = 0 # Защита, если обработали больше, чем было (напр. гонка)
     
     # Считаем, сколько в "NEW"
     new_count = sum(1 for t in all_tasks if _task_status_str(t).upper() == NEW_STATUS)
