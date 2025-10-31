@@ -12,7 +12,7 @@ from clickup_client import (
 )
 from mailer import send_email
 from email_validator import validate_email_if_needed
-from telegram_bot import _task_status_str # Импортируем хелпер статуса
+from utils import _task_status_str # <-- 🟢 ИСПРАВЛЕН ИМПОРТ
 
 log = logging.getLogger("sender")
 router = APIRouter()
@@ -63,7 +63,8 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
     # 2. Фильтруем по статусу "READY"
     ready_tasks = []
     for t in all_tasks:
-        if _task_status_str(t).upper() == READY_STATUS:
+        # Используем импортированную функцию
+        if _task_status_str(t).upper() == READY_STATUS: 
             ready_tasks.append(t)
     
     # 3. Берем 'limit' из готовых к отправке
@@ -116,7 +117,7 @@ def run_send(state: str, limit: int = 50) -> Dict[str, Any]:
             log.info("Sending email to %s for %s", email, clinic_name)
             ok = send_email(
                 to_email=email,
-                clinic_name=clinic_name, # <-- Исправлено (было clinic_name)
+                clinic_name=clinic_name,
                 clinic_site=website # website может быть None, mailer.py это обработает
             )
             
@@ -158,6 +159,4 @@ def send_proposals(state: str, limit: int = 50) -> Dict[str, Any]:
     try:
         return run_send(state=state, limit=limit)
     except RuntimeError as e:
-        # ===== 🟢 ВОТ ИСПРАВЛЕНИЕ 🟢 =====
-        # Строка ниже ДОЛЖНА быть с отступом
-        raise HTTPException
+        raise HTTPException(status_code=500, detail=str(e))
