@@ -11,9 +11,19 @@ from config import settings
 
 log = logging.getLogger("mailer")
 
+# реальные ссылки из твоей почты
+TAPGROW_LOGO_URL = (
+    "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/"
+    "email-signature/media/tapgrow-logo.png"
+)
+SVETLANA_PHOTO_URL = (
+    "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/"
+    "email-signature/photo-team/miroshkina-photo.png"
+)
+
 
 def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str) -> str:
-    # нормализуем имя и сайт
+    # ---------- безопасные значения ----------
     safe_clinic = clinic_name.strip() if clinic_name else "your practice"
 
     safe_site_text = "your website"
@@ -25,7 +35,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
         else:
             safe_site_link = clinic_site
 
-    # ====== ТЕКСТ ПИСЬМА ======
+    # ---------- ОСНОВНОЙ ТЕКСТ ПИСЬМА ----------
     body_html = f"""
 <p style="margin: 0 0 16px 0;">Hi, {safe_clinic}!</p>
 
@@ -63,37 +73,34 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 <p style="margin: 0 0 16px 0;"><b>Just reply to this email — we’ll handle the rest.</b></p>
 """.strip()
 
-    # ====== ВАЖНО: твоя фотка сейчас портретная, а Gmail не режет в круг ======
-    # лучше всего сюда дать КВАДРАТНУЮ версию, если сделаешь:
-    # avatar_url = "https://.../miroshkina-photo-200x200.png"
-    avatar_url = (
-        "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/"
-        "email-signature/photo-team/miroshkina-photo.png"
-    )
-
-    # ====== ПОДПИСЬ: максимально совместимая ======
+    # ---------- ПОДПИСЬ  ----------
+    # без max-width, с твоими картинками
     signature_html = f"""
 <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-top:24px;">
   <tr>
     <td align="center">
       <table width="100%" border="0" cellspacing="0" cellpadding="0"
-             style="width:100%; max-width:780px; background-color:#0b0b0b;
-                    border-radius:22px; overflow:hidden; font-family:Arial,Helvetica,sans-serif;">
+             style="width:100%;
+                    background:#0b0b0b;
+                    background-image:radial-gradient(circle at top, #2a3d25 0%, #0b0b0b 55%, #0b0b0b 100%);
+                    border-radius:26px;
+                    overflow:hidden;
+                    font-family:Arial,Helvetica,sans-serif;">
         <tr>
-          <td style="padding:40px 40px 40px 40px;">
-            <!-- логотип текстом, без картинок -->
-            <p style="margin:0 0 26px 0; font-size:22px; font-weight:600; color:#b8ff7a; letter-spacing:1px;">
-              tapgrow
+          <td style="padding:46px 40px 40px 40px;">
+            <!-- ЛОГОТИП КАРТИНКОЙ -->
+            <p style="margin:0 0 28px 0;">
+              <img src="{TAPGROW_LOGO_URL}" alt="tapgrow"
+                   style="display:block; max-width:160px; height:auto;">
             </p>
 
             <table width="100%" border="0" cellspacing="0" cellpadding="0">
               <tr valign="top">
-                <td width="120" style="padding-right:28px;" align="center">
-                  <!-- Gmail не любит object-fit, поэтому ставим только width/height -->
-                  <img src="{avatar_url}" alt="Svetlana Miroshkina"
-                       width="110" height="110"
-                       style="display:block; border-radius:55px; border:3px solid rgba(184,255,122,0.45); background:#0b0b0b;">
-                  <!-- если фото не будет квадратным — он просто уместит по высоте -->
+                <td width="130" style="padding-right:28px;" align="center">
+                  <img src="{SVETLANA_PHOTO_URL}" alt="Svetlana Miroshkina"
+                       width="118" height="118"
+                       style="display:block; border-radius:59px;
+                              border:3px solid rgba(184,255,122,0.45); background:#0b0b0b;">
                 </td>
                 <td>
                   <p style="margin:0 0 6px 0; font-size:24px; font-weight:700; color:#ffffff;">
@@ -134,7 +141,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
                     </tr>
                   </table>
 
-                  <p style="margin:24px 0 0 0;">
+                  <p style="margin:26px 0 0 0;">
                     <a href="https://behance.net/tapgrow"
                        style="display:inline-block; background:#b8ff7a; color:#0b0b0b;
                               padding:8px 16px; border-radius:10px; font-size:13px;
@@ -152,7 +159,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               </tr>
             </table>
 
-            <p style="margin:32px 0 0 0; font-size:11px; line-height:1.5; color:#7b847c;">
+            <p style="margin:34px 0 0 0; font-size:11px; line-height:1.5; color:#7b847c;">
               The information contained in this message is intended solely for the use by the individual or entity
               to whom it is addressed and others authorized to receive it. If you are not the intended recipient,
               please notify us immediately and delete this message.
@@ -166,7 +173,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 </table>
 """.strip()
 
-    # ====== ВЕСЬ HTML ======
+    # ---------- ВЕСЬ HTML ЦЕЛИКОМ ----------
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -177,17 +184,16 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
   <body style="margin:0; padding:0; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:16px; line-height:1.6; color:#111;">
     <table width="100%" border="0" cellspacing="0" cellpadding="0">
       <tr>
-        <td align="center" style="padding:24px 12px 12px 12px;">
-          <!-- блок с текстом -->
-          <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width:640px; margin:0 auto 16px auto;">
+        <td align="center" style="padding:0;">
+          <!-- текст письма в узком блоке -->
+          <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width:640px; margin:24px auto 16px auto;">
             <tr>
-              <td style="text-align:left;">
+              <td style="text-align:left; padding:0 12px;">
                 {body_html}
               </td>
             </tr>
           </table>
-
-          <!-- подпись на всю доступную ширину -->
+          <!-- подпись на всю ширину -->
           {signature_html}
         </td>
       </tr>
@@ -203,8 +209,7 @@ def build_email_text(clinic_name: str, clinic_site: Optional[str]) -> str:
     return (
         f"Hi, {safe_clinic}!\n\n"
         f"We took a quick look at {site} and noticed a few areas to improve.\n"
-        f"From our experience working with dental clinics, this pattern appears often:\n"
-        f"- Slow loading\n- Confusing mobile layout\n- Weak SEO\n\n"
+        f"From our experience working with dental clinics, this pattern appears often.\n"
         f"See our work: https://behance.net/tapgrow\n"
         f"Read reviews: https://www.upwork.com/ag/tapgrow/\n\n"
         f"Just reply to this email — we'll handle the rest."
@@ -229,11 +234,13 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
+        # у тебя SMTP 465 (SSL) → подключаемся так
         if settings.SMTP_PORT == 465:
             server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
         else:
             server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
             server.starttls()
+
         server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
         server.sendmail(settings.SMTP_FROM, [to_email], msg.as_string())
         server.quit()
