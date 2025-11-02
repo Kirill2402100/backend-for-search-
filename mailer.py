@@ -24,7 +24,6 @@ ICON_TELEGRAM = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signa
 
 
 def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str) -> str:
-    # нормализуем вход
     safe_clinic = clinic_name.strip() if clinic_name else "your practice"
 
     safe_site_text = "your website"
@@ -33,7 +32,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
         safe_site_text = re.sub(r"^(https?://)?(www\.)?", "", clinic_site).strip("/")
         safe_site_link = clinic_site if clinic_site.startswith("http") else f"https://{clinic_site}"
 
-    # основной текст
     body_html = f"""
 <p style="margin: 0 0 16px 0;">Hi, {safe_clinic}!</p>
 
@@ -71,7 +69,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 <p style="margin: 0 0 16px 0;"><b>Just reply to this email — we’ll handle the rest.</b></p>
 """.strip()
 
-    # подпись
     signature_html = f"""
 <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-top:24px;">
   <tr>
@@ -87,17 +84,14 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
                     font-family:Arial,Helvetica,sans-serif;">
         <tr>
           <td align="center" style="padding:40px 48px 42px 48px;">
-            <!-- логотип -->
             <img src="{TAPGROW_LOGO_URL}" alt="tapgrow"
                  style="display:block; max-width:150px; height:auto; margin:0 auto 28px auto;">
 
-            <!-- фото -->
             <img src="{SVETLANA_PHOTO_URL}" alt="Svetlana Miroshkina"
                  width="118" height="118"
                  style="display:block; border-radius:59px; border:3px solid rgba(184,255,122,0.45);
                         background:#0b0b0b; margin:0 auto 22px auto;">
 
-            <!-- имя -->
             <p style="margin:0 0 6px 0; font-size:24px; font-weight:700; color:#ffffff; text-align:center;">
               Svetlana Miroshkina
             </p>
@@ -105,7 +99,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               Project Manager
             </p>
 
-            <!-- контакты -->
             <table border="0" cellspacing="0" cellpadding="0" style="margin:0 auto; text-align:center; font-size:14px; color:#ffffff;">
               <tr>
                 <td style="padding:4px 0;">
@@ -137,19 +130,18 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               </tr>
             </table>
 
-            <!-- соцсети (уменьшенные) -->
+            <!-- соцсети 25х25 + правильный TG -->
             <p style="margin:26px 0 0 0; text-align:center;">
               <a href="https://behance.net/tapgrow"
                  style="display:inline-block; margin-right:10px;">
-                <img src="{ICON_BEHANCE}" alt="Behance" width="30" height="30" style="display:block;">
+                <img src="{ICON_BEHANCE}" alt="Behance" width="25" height="25" style="display:block;">
               </a>
               <a href="https://t.me/tapgrow"
                  style="display:inline-block;">
-                <img src="{ICON_TELEGRAM}" alt="Telegram" width="30" height="30" style="display:block;">
+                <img src="{ICON_TELEGRAM}" alt="Telegram" width="25" height="25" style="display:block;">
               </a>
             </p>
 
-            <!-- дисклеймер -->
             <p style="margin:34px 0 0 0; font-size:11px; line-height:1.5; color:#7b847c; text-align:center;">
               The information contained in this message is intended solely for the use by the individual or entity
               to whom it is addressed and others authorized to receive it. If you are not the intended recipient,
@@ -164,7 +156,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 </table>
 """.strip()
 
-    # весь html
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -176,7 +167,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
     <table width="100%" border="0" cellspacing="0" cellpadding="0">
       <tr>
         <td align="center" style="padding:0;">
-          <!-- текст -->
           <table width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width:640px; margin:24px auto 16px auto;">
             <tr>
               <td style="text-align:left; padding:0 12px;">
@@ -184,7 +174,6 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               </td>
             </tr>
           </table>
-          <!-- подпись -->
           {signature_html}
         </td>
       </tr>
@@ -222,7 +211,6 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        # у тебя сейчас SSL:465 — значит так и оставляем
         if settings.SMTP_PORT == 465:
             server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
         else:
