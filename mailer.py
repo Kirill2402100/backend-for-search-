@@ -24,7 +24,7 @@ ICON_TELEGRAM = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signa
 
 
 def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str) -> str:
-    # нормализуем то, что пришло из ClickUp
+    # нормализуем вход
     safe_clinic = clinic_name.strip() if clinic_name else "your practice"
 
     safe_site_text = "your website"
@@ -33,7 +33,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
         safe_site_text = re.sub(r"^(https?://)?(www\.)?", "", clinic_site).strip("/")
         safe_site_link = clinic_site if clinic_site.startswith("http") else f"https://{clinic_site}"
 
-    # тело письма (как у тебя было)
+    # основной текст
     body_html = f"""
 <p style="margin: 0 0 16px 0;">Hi, {safe_clinic}!</p>
 
@@ -71,7 +71,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 <p style="margin: 0 0 16px 0;"><b>Just reply to this email — we’ll handle the rest.</b></p>
 """.strip()
 
-    # подпись — ширина 100%, два градиента, иконки по центру
+    # подпись
     signature_html = f"""
 <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-top:24px;">
   <tr>
@@ -105,7 +105,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               Project Manager
             </p>
 
-            <!-- контакты по центру с твоими иконками -->
+            <!-- контакты -->
             <table border="0" cellspacing="0" cellpadding="0" style="margin:0 auto; text-align:center; font-size:14px; color:#ffffff;">
               <tr>
                 <td style="padding:4px 0;">
@@ -137,15 +137,15 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               </tr>
             </table>
 
-            <!-- соцсети (это у тебя готовые зеленые кружки) -->
+            <!-- соцсети (уменьшенные) -->
             <p style="margin:26px 0 0 0; text-align:center;">
               <a href="https://behance.net/tapgrow"
                  style="display:inline-block; margin-right:10px;">
-                <img src="{ICON_BEHANCE}" alt="Behance" width="36" height="36" style="display:block;">
+                <img src="{ICON_BEHANCE}" alt="Behance" width="30" height="30" style="display:block;">
               </a>
-              <a href="https://www.upwork.com/ag/tapgrow/"
+              <a href="https://t.me/tapgrow"
                  style="display:inline-block;">
-                <img src="{ICON_TELEGRAM}" alt="Telegram" width="36" height="36" style="display:block;">
+                <img src="{ICON_TELEGRAM}" alt="Telegram" width="30" height="30" style="display:block;">
               </a>
             </p>
 
@@ -164,7 +164,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 </table>
 """.strip()
 
-    # всё письмо
+    # весь html
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -218,11 +218,11 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg["Message-ID"] = make_msgid(domain=settings.SMTP_FROM.split("@")[-1])
     msg["Reply-To"] = settings.SMTP_FROM
 
-    # и plain, и html — чтобы спам-фильтры меньше ругались
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
+        # у тебя сейчас SSL:465 — значит так и оставляем
         if settings.SMTP_PORT == 465:
             server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
         else:
