@@ -1,4 +1,3 @@
-# mailer.py
 import smtplib
 import logging
 import re
@@ -15,12 +14,32 @@ log = logging.getLogger("mailer")
 TAPGROW_LOGO_URL = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/tapgrow-logo.png"
 SVETLANA_PHOTO_URL = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/photo-team/miroshkina-photo.png"
 
+# --- Иконки контактов ---
 ICON_MAIL = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/mail-icon.png"
 ICON_GLOBE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/website-icon.png"
 ICON_PHONE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/phone-icon.png"
 ICON_LOCATION = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/location-icon.png"
+
+# --- Иконки соцсетей (СТАРЫЕ) ---
 ICON_BEHANCE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/behance-icon.png"
 ICON_TELEGRAM = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/telegram-icon.png"
+
+# --- Иконки соцсетей (НОВЫЕ ДОБАВЛЕННЫЕ) ---
+ICON_INSTAGRAM = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/instagram%20(1).png"
+ICON_UPWORK = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/upwork%20(1).png"
+ICON_LINKEDIN = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/linkedin.png"
+ICON_DRIBBBLE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/dribbble.png"
+ICON_FACEBOOK = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/facebook.png"
+
+# --- Ссылки на соцсети (ОБНОВЛЕНО) ---
+# (Я нашел реальные ссылки для 'tapgrow')
+LINK_BEHANCE = "https://behance.net/tapgrow"
+LINK_DRIBBBLE = "https://dribbble.com/tapgrow"
+LINK_UPWORK = "https://www.upwork.com/ag/tapgrow/"
+LINK_LINKEDIN = "https://www.linkedin.com/company/tapgrow/"
+LINK_INSTAGRAM = "https://www.instagram.com/tapgrow.studio/"
+LINK_FACEBOOK = "https://www.facebook.com/tapgrow.studio/"
+LINK_TELEGRAM = "https://t.me/tapgrow"
 
 
 def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str) -> str:
@@ -130,17 +149,45 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               </tr>
             </table>
 
-            <!-- соцсети 25х25 + правильный TG -->
+            <!-- ===== БЛОК СОЦСЕТЕЙ (ОБНОВЛЕН) ===== -->
             <p style="margin:26px 0 0 0; text-align:center;">
-              <a href="https://behance.net/tapgrow"
+              <!-- Behance -->
+              <a href="{LINK_BEHANCE}"
                  style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_BEHANCE}" alt="Behance" width="25" height="25" style="display:block;">
               </a>
-              <a href="https://t.me/tapgrow"
+              <!-- Dribbble -->
+              <a href="{LINK_DRIBBBLE}"
+                 style="display:inline-block; margin-right:10px;">
+                <img src="{ICON_DRIBBBLE}" alt="Dribbble" width="25" height="25" style="display:block;">
+              </a>
+              <!-- Upwork -->
+              <a href="{LINK_UPWORK}"
+                 style="display:inline-block; margin-right:10px;">
+                <img src="{ICON_UPWORK}" alt="Upwork" width="25" height="25" style="display:block;">
+              </a>
+              <!-- LinkedIn -->
+              <a href="{LINK_LINKEDIN}"
+                 style="display:inline-block; margin-right:10px;">
+                <img src="{ICON_LINKEDIN}" alt="LinkedIn" width="25" height="25" style="display:block;">
+              </a>
+              <!-- Instagram -->
+              <a href="{LINK_INSTAGRAM}"
+                 style="display:inline-block; margin-right:10px;">
+                <img src="{ICON_INSTAGRAM}" alt="Instagram" width="25" height="25" style="display:block;">
+              </a>
+              <!-- Facebook -->
+              <a href="{LINK_FACEBOOK}"
+                 style="display:inline-block; margin-right:10px;">
+                <img src="{ICON_FACEBOOK}" alt="Facebook" width="25" height="25" style="display:block;">
+              </a>
+              <!-- Telegram (последний, без отступа) -->
+              <a href="{LINK_TELEGRAM}"
                  style="display:inline-block;">
                 <img src="{ICON_TELEGRAM}" alt="Telegram" width="25" height="25" style="display:block;">
               </a>
             </p>
+            <!-- ===== КОНЕЦ БЛОКА СОЦСЕТЕЙ ===== -->
 
             <p style="margin:34px 0 0 0; font-size:11px; line-height:1.5; color:#7b847c; text-align:center;">
               The information contained in this message is intended solely for the use by the individual or entity
