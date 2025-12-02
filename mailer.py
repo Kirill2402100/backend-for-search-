@@ -1,6 +1,8 @@
+# mailer.py
 import smtplib
 import logging
 import re
+import json
 from typing import Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -10,7 +12,7 @@ from config import settings
 
 log = logging.getLogger("mailer")
 
-# ===== ТВОИ РЕАЛЬНЫЕ URL =====
+# ===== Реальные URL ассетов =====
 TAPGROW_LOGO_URL = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/tapgrow-logo.png"
 SVETLANA_PHOTO_URL = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/photo-team/miroshkina-photo.png"
 
@@ -20,19 +22,16 @@ ICON_GLOBE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signatur
 ICON_PHONE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/phone-icon.png"
 ICON_LOCATION = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/location-icon.png"
 
-# --- Иконки соцсетей (СТАРЫЕ) ---
+# --- Иконки соцсетей ---
 ICON_BEHANCE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/behance-icon.png"
 ICON_TELEGRAM = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/telegram-icon.png"
-
-# --- Иконки соцсетей (НОВЫЕ ДОБАВЛЕННЫЕ) ---
 ICON_INSTAGRAM = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/instagram%20(1).png"
 ICON_UPWORK = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/upwork%20(1).png"
 ICON_LINKEDIN = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/linkedin.png"
 ICON_DRIBBBLE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/dribbble.png"
 ICON_FACEBOOK = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/facebook.png"
 
-# --- Ссылки на соцсети (ОБНОВЛЕНО) ---
-# (Я нашел реальные ссылки для 'tapgrow')
+# --- Ссылки на соцсети ---
 LINK_BEHANCE = "https://behance.net/tapgrow"
 LINK_DRIBBBLE = "https://dribbble.com/tapgrow"
 LINK_UPWORK = "https://www.upwork.com/ag/tapgrow/"
@@ -149,45 +148,30 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
               </tr>
             </table>
 
-            <!-- ===== БЛОК СОЦСЕТЕЙ (ОБНОВЛЕН) ===== -->
+            <!-- ===== Соцсети ===== -->
             <p style="margin:26px 0 0 0; text-align:center;">
-              <!-- Behance -->
-              <a href="{LINK_BEHANCE}"
-                 style="display:inline-block; margin-right:10px;">
+              <a href="{LINK_BEHANCE}" style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_BEHANCE}" alt="Behance" width="25" height="25" style="display:block;">
               </a>
-              <!-- Dribbble -->
-              <a href="{LINK_DRIBBBLE}"
-                 style="display:inline-block; margin-right:10px;">
+              <a href="{LINK_DRIBBBLE}" style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_DRIBBBLE}" alt="Dribbble" width="25" height="25" style="display:block;">
               </a>
-              <!-- Upwork -->
-              <a href="{LINK_UPWORK}"
-                 style="display:inline-block; margin-right:10px;">
+              <a href="{LINK_UPWORK}" style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_UPWORK}" alt="Upwork" width="25" height="25" style="display:block;">
               </a>
-              <!-- LinkedIn -->
-              <a href="{LINK_LINKEDIN}"
-                 style="display:inline-block; margin-right:10px;">
+              <a href="{LINK_LINKEDIN}" style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_LINKEDIN}" alt="LinkedIn" width="25" height="25" style="display:block;">
               </a>
-              <!-- Instagram -->
-              <a href="{LINK_INSTAGRAM}"
-                 style="display:inline-block; margin-right:10px;">
+              <a href="{LINK_INSTAGRAM}" style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_INSTAGRAM}" alt="Instagram" width="25" height="25" style="display:block;">
               </a>
-              <!-- Facebook -->
-              <a href="{LINK_FACEBOOK}"
-                 style="display:inline-block; margin-right:10px;">
+              <a href="{LINK_FACEBOOK}" style="display:inline-block; margin-right:10px;">
                 <img src="{ICON_FACEBOOK}" alt="Facebook" width="25" height="25" style="display:block;">
               </a>
-              <!-- Telegram (последний, без отступа) -->
-              <a href="{LINK_TELEGRAM}"
-                 style="display:inline-block;">
+              <a href="{LINK_TELEGRAM}" style="display:inline-block;">
                 <img src="{ICON_TELEGRAM}" alt="Telegram" width="25" height="25" style="display:block;">
               </a>
             </p>
-            <!-- ===== КОНЕЦ БЛОКА СОЦСЕТЕЙ ===== -->
 
             <p style="margin:34px 0 0 0; font-size:11px; line-height:1.5; color:#7b847c; text-align:center;">
               The information contained in this message is intended solely for the use by the individual or entity
@@ -240,7 +224,13 @@ def build_email_text(clinic_name: str, clinic_site: Optional[str]) -> str:
     )
 
 
-def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> bool:
+def send_email(
+    to_email: str,
+    clinic_name: str,
+    clinic_site: Optional[str],
+    tags: Optional[list[str]] = None,   # опционально: Brevo-теги в отчетах
+    custom: Optional[dict] = None       # опционально: произвольные поля (JSON)
+) -> bool:
     subject = "Quick audit: a few easy wins for your dental website 🦷"
 
     html_body = build_email_html(clinic_name, clinic_site, subject)
@@ -254,15 +244,29 @@ def send_email(to_email: str, clinic_name: str, clinic_site: Optional[str]) -> b
     msg["Message-ID"] = make_msgid(domain=settings.SMTP_FROM.split("@")[-1])
     msg["Reply-To"] = settings.SMTP_FROM
 
+    # Deliverability + возможность отписки
+    msg["List-Unsubscribe"] = f"<mailto:{settings.SMTP_FROM}?subject=unsubscribe>"
+
+    # Brevo analytics
+    if tags:
+        msg["X-Mailin-Tag"] = ",".join(tags)
+    if custom:
+        msg["X-Mailin-Custom"] = json.dumps(custom, ensure_ascii=True)
+
+    # Две части — plain и html
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        if settings.SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT)
+        port = int(settings.SMTP_PORT)
+        if port == 465:
+            server = smtplib.SMTP_SSL(settings.SMTP_HOST, port)
         else:
-            server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+            server = smtplib.SMTP(settings.SMTP_HOST, port)
+            server.ehlo()
             server.starttls()
+            server.ehlo()
+
         server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
         server.sendmail(settings.SMTP_FROM, [to_email], msg.as_string())
         server.quit()
