@@ -23,7 +23,7 @@ ICON_GLOBE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signatur
 ICON_PHONE = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/phone-icon.png"
 ICON_LOCATION = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/location-icon.png"
 
-# ----- Иконки соцсетей (твои URL) -----
+# ----- Иконки соцсетей -----
 ICON_BEHANCE   = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/behance-icon.png"
 ICON_TELEGRAM  = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/telegram-icon.png"
 ICON_UPWORK    = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/upwork%20(1).png"
@@ -32,14 +32,14 @@ ICON_LINKEDIN  = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-sign
 ICON_DRIBBBLE  = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/dribbble.png"
 ICON_FACEBOOK  = "https://pub-000b21bd62be4ca680859b2e1bedd0ce.r2.dev/email-signature/media/facebook.png"
 
-# Соц-ссылки (поставил разумные — поправь при необходимости)
+# ----- Соц-ссылки -----
 URL_BEHANCE   = "https://behance.net/tapgrow"
 URL_TELEGRAM  = "https://t.me/tapgrow"
 URL_UPWORK    = "https://www.upwork.com/ag/tapgrow/"
 URL_INSTAGRAM = "https://instagram.com/tapgrow.studio"
-URL_LINKEDIN  = "https://www.linkedin.com/company/tapgrow/"  # обнови при необходимости
-URL_DRIBBBLE  = "https://dribbble.com/tapgrow"               # обнови при необходимости
-URL_FACEBOOK  = "https://facebook.com/tapgrow.studio"        # обнови при необходимости
+URL_LINKEDIN  = "https://www.linkedin.com/company/tapgrow/"
+URL_DRIBBBLE  = "https://dribbble.com/tapgrowstudio"   # <— исправлено
+URL_FACEBOOK  = "https://facebook.com/tapgrow.studio"
 
 
 def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str) -> str:
@@ -51,6 +51,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
         safe_site_text = re.sub(r"^(https?://)?(www\.)?", "", clinic_site).strip("/")
         safe_site_link = clinic_site if clinic_site.startswith("http") else f"https://{clinic_site}"
 
+    # ---- основной текст
     body_html = f"""
 <p style="margin: 0 0 16px 0;">Hi, {safe_clinic}!</p>
 
@@ -59,24 +60,23 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 <p style="margin: 0 0 16px 0;">From our experience working with dental clinics, this pattern appears often:</p>
 
 <ul style="padding-left: 20px; margin: 0 0 16px 0;">
-    <li><b>Slow loading</b> → up to 40% of visitors leave before booking.</li>
-    <li><b>Confusing mobile layout</b> → missed calls and form submissions.</li>
-    <li><b>Weak SEO</b> → local competitors rank higher.</li>
+  <li><b>Slow loading</b> → up to 40% of visitors leave before booking.</li>
+  <li><b>Confusing mobile layout</b> → missed calls and form submissions.</li>
+  <li><b>Weak SEO</b> → local competitors rank higher.</li>
 </ul>
 
 <p style="margin: 0 0 16px 0;">At TapGrow Studio, we specialize in building and optimizing websites for dental practices that are designed to:</p>
 
 <ul style="padding-left: 20px; margin: 0 0 16px 0;">
-    <li>✅ Attract patients through higher Google rankings</li>
-    <li>✅ Build instant trust with a modern, credible design</li>
-    <li>✅ Turn visitors into booked appointments with optimized UX</li>
+  <li>✅ Attract patients through higher Google rankings</li>
+  <li>✅ Build instant trust with a modern, credible design</li>
+  <li>✅ Turn visitors into booked appointments with optimized UX</li>
 </ul>
 
 <p style="margin: 0 0 16px 0;">Since 2017, our 12-person team has delivered 140+ projects with 93% client retention — we know what works in the dental niche.</p>
 
 <p style="margin: 0 0 16px 0;">
-    See our work → <a href="https://behance.net/tapgrow" target="_blank" style="color: #1a73e8;">behance.net/tapgrow</a><br/>
-    Read reviews → <a href="https://www.upwork.com/ag/tapgrow/" target="_blank" style="color: #1a73e8;">TapGrow on Upwork</a>
+  See our work and reviews → <a href="{URL_BEHANCE}" target="_blank" style="color: #1a73e8;">behance.net/tapgrow</a>
 </p>
 
 <p style="margin: 0 0 16px 0;">We’ve helped many clinics improve their results with just a few focused updates.</p>
@@ -88,6 +88,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
 <p style="margin: 0 0 16px 0;"><b>Just reply to this email — we’ll handle the rest.</b></p>
 """.strip()
 
+    # ---- подпись
     signature_html = f"""
 <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-top:24px;">
   <tr>
@@ -103,6 +104,7 @@ def build_email_html(clinic_name: str, clinic_site: Optional[str], subject: str)
                     font-family:Arial,Helvetica,sans-serif;">
         <tr>
           <td align="center" style="padding:40px 48px 42px 48px;">
+
             <img src="{TAPGROW_LOGO_URL}" alt="tapgrow"
                  style="display:block; max-width:150px; height:auto; margin:0 auto 28px auto;">
 
@@ -245,6 +247,7 @@ def _append_to_imap_sent(msg_obj) -> None:
         m = imaplib.IMAP4_SSL(host, port)
         m.login(user, pwd)
 
+        # 1) Определяем папку «Отправленные»
         sent_box = default_box or None
         if not sent_box:
             typ, data = m.list()
@@ -257,7 +260,7 @@ def _append_to_imap_sent(msg_obj) -> None:
                             sent_box = parts[1].strip().strip('"')
                             break
         if not sent_box:
-            for name in ["Sent", "Sent Items", "Отправленные", "Sent Messages", "[Gmail]/Sent Mail"]:
+            for name in ["INBOX.Sent", "Sent", "Sent Items", "Отправленные", "Sent Messages", "[Gmail]/Sent Mail"]:
                 try:
                     if m.select(f'"{name}"')[0] == "OK":
                         sent_box = name
@@ -270,13 +273,35 @@ def _append_to_imap_sent(msg_obj) -> None:
             m.logout()
             return
 
+        # 2) Пытаемся положить письмо
         raw_bytes = msg_obj.as_bytes()
         flags = r"(\Seen)"
         resp = m.append(sent_box, flags, None, raw_bytes)
-        if resp[0] != "OK":
-            log.warning("IMAP append returned non-OK: %s", resp)
+
+        # 3) Если не получилось — пробуем популярные кандидаты
+        if not resp or resp[0] != "OK":
+            log.warning("IMAP append returned non-OK for '%s': %s", sent_box, resp)
+            for cand in ["INBOX.Sent", "Sent", "Sent Items", "Отправленные", "[Gmail]/Sent Mail"]:
+                if cand == sent_box:
+                    continue
+                try:
+                    sel = m.select(f'"{cand}"')
+                    if sel and sel[0] == "OK":
+                        resp2 = m.append(cand, flags, None, raw_bytes)
+                        if resp2 and resp2[0] == "OK":
+                            sent_box = cand
+                            resp = resp2
+                            break
+                except Exception:
+                    continue
+
+        if resp and resp[0] == "OK":
+            log.info("IMAP append: saved copy to '%s'", sent_box)
+        else:
+            log.warning("IMAP append failed for all candidates: %s", resp)
+
         m.logout()
-        log.info("IMAP append: saved copy to '%s'", sent_box)
+
     except Exception as e:
         log.warning("IMAP append failed: %s", e)
 
@@ -302,15 +327,17 @@ def send_email(
     msg["Reply-To"] = settings.SMTP_FROM
     msg["List-Unsubscribe"] = f"<mailto:{settings.SMTP_FROM}?subject=unsubscribe>"
 
+    # Трекинг (Brevo/Sendinblue)
     if tags:
         msg["X-Mailin-Tag"] = ",".join(tags)
     if custom:
         msg["X-Mailin-Custom"] = json.dumps(custom, ensure_ascii=True)
 
+    # MIME части
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    # получатели (+опц. BCC на себя)
+    # Получатели (+ опц. BCC себе во Входящие)
     recipients = [to_email]
     try:
         if str(getattr(settings, "BCC_SELF", "0")) == "1":
@@ -332,7 +359,7 @@ def send_email(
 
         log.info("Email successfully sent to %s", to_email)
 
-        # кладём копию в «Отправленные» (если IMAP настроен)
+        # Кладём копию в «Отправленные» (если IMAP настроен)
         _append_to_imap_sent(msg)
 
         return True
