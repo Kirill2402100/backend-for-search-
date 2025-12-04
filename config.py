@@ -16,18 +16,25 @@ class Settings(BaseSettings):
 
     # --- SMTP / почта ---
     SMTP_HOST: str = ""
-    SMTP_PORT: int = 587
+    SMTP_PORT: int = 587                # 465 = SSL, 587 = STARTTLS
     SMTP_USERNAME: str = ""
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = ""
+
+    # --- IMAP / «Отправленные» ---
+    IMAP_HOST: str = ""                 # напр. imap.tapgrow.studio
+    IMAP_PORT: int = 993                # обычно 993 (SSL)
+    IMAP_USERNAME: str = ""
+    IMAP_PASSWORD: str = ""
+    IMAP_SENT_FOLDER: str = ""          # напр. "Sent" | "Sent Items" | "Отправленные"; если пусто — определяется автоматически
+    BCC_SELF: int = 0                   # 1 = добавлять BCC на свой адрес, 0 = выключено
 
     # --- валидация email ---
     EMAIL_VALIDATION_PROVIDER: str = ""  # например, "abstractapi"
     EMAIL_VALIDATION_API_KEY: str = ""
 
     # --- Google / сбор клиник ---
-    # ВАЖНО: это поле нужно, чтобы leads.py увидел ключ
-    GOOGLE_PLACES_API_KEY: str = ""
+    GOOGLE_PLACES_API_KEY: str = ""      # нужно, чтобы leads.py увидел ключ
 
     class Config:
         env_file = ".env"
